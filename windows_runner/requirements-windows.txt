@@ -1,0 +1,5 @@
+selenium>=4.20
+psycopg2-binary>=2.9
+beautifulsoup4>=4.12
+
+# Why psycopg2-binary on Windows? It bundles the native bits so you don’t have to install libpq/build tools. If you already have a compiled psycopg2 working, feel free to keep it.

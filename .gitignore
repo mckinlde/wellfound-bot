@@ -1,0 +1,11 @@
+# Logs
+*.log
+
+# HTML capture output
+html_captures/
+
+# .pyc
+*.pyc
+
+# Flake.lock
+*.lock
