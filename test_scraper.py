@@ -62,6 +62,9 @@ def capture(url: str, timeout: int) -> Path:
         # Save to html_captures using shared helper for consistency
         write_html_to_file(html, f"{sanitize_for_filename(url)}.html")
 
+        print("\nPress Enter to close the browser window...")
+        input()
+
         return debug_path
 
 
