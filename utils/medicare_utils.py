@@ -164,12 +164,14 @@ def scrape_plan_detail_page(driver, zipcode, base_dir=".", timeout=10):
         except:
             pass
 
-    output_dir = os.path.join(base_dir, "medicare_dot_gov_html")
+    output_dir = os.path.join(base_dir, "medicare_zncti")
     os.makedirs(output_dir, exist_ok=True)
 
+    safe_plan_name = re.sub(r'\W+', '_', plan_name)
     safe_company = re.sub(r'\W+', '_', company)
+    safe_plan_type = re.sub(r'\W+', '_', plan_type)
     safe_plan_id = re.sub(r'\W+', '_', plan_id)
-    filename = f"{zipcode}_{safe_company}_{safe_plan_id}.html"
+    filename = f"z,{zipcode}_n,{safe_plan_name}_c,{safe_company}_t,{safe_plan_type}_i,{safe_plan_id}.html"
     filepath = os.path.join(output_dir, filename)
 
     with open(filepath, "w", encoding="utf-8") as f:
@@ -185,6 +187,7 @@ def scrape_plan_detail_page(driver, zipcode, base_dir=".", timeout=10):
 
 
 def scrape_all_plan_details(driver, zipcode, base_dir=".", timeout=10):
+    sleep(1)
     """Iterate all result pages; open each plan detail, scrape, go back, continue."""
     wait = WebDriverWait(driver, timeout)
     results = []
@@ -199,6 +202,7 @@ def scrape_all_plan_details(driver, zipcode, base_dir=".", timeout=10):
         total = len(link_elems)
 
         for i in range(total):
+            sleep(1)
             # Re-find fresh elements each iteration to avoid stale references
             link_elems = driver.find_elements(By.CSS_SELECTOR, 'a.e2e-plan-details-btn')
             if i >= len(link_elems):
@@ -211,6 +215,7 @@ def scrape_all_plan_details(driver, zipcode, base_dir=".", timeout=10):
 
             # Wait for the plan details header to confirm navigation
             try:
+                sleep(1)
                 WebDriverWait(driver, timeout).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, 'h1.e2e-plan-details-plan-header'))
                 )
@@ -227,6 +232,7 @@ def scrape_all_plan_details(driver, zipcode, base_dir=".", timeout=10):
 
             # Go back to the results list and wait for buttons to reappear
             driver.back()
+            sleep(1)
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'a.e2e-plan-details-btn')))
 
         # Try to advance pagination
@@ -243,7 +249,9 @@ def scrape_all_plan_details(driver, zipcode, base_dir=".", timeout=10):
 
             # Wait until the list actually updates
             if first_before:
+                sleep(1)
                 wait.until(EC.staleness_of(first_before))
+            sleep(1)
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'a.e2e-plan-details-btn')))
             page += 1
         except Exception:
