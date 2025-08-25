@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_scraper.py (Wellfound capture)
+test_scraper.py (html capture)
 
 Open a Wellfound page and save the raw HTML to:
 - ./logs/debug/<timestamp>__<sanitized-url>.html
@@ -9,7 +9,7 @@ Open a Wellfound page and save the raw HTML to:
 Usage:
   nix develop
   python3 test_scraper.py
-  python3 test_scraper.py --url "https://wellfound.com/l/remote-jobs"
+  python3 test_scraper.py --url "https://https://news.ycombinator.com/"
   python3 test_scraper.py --timeout 15
 """
 
@@ -19,13 +19,13 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
-from driver_session import (
+from utils.driver_session import (
     start_driver,
     get_soup_from_url,
     write_html_to_file,
 )
 
-DEFAULT_URL = "https://wellfound.com"
+DEFAULT_URL = "https://www.medicare.gov/plan-compare/#/?year=2025&lang=en"
 
 
 def ensure_dirs() -> None:
@@ -69,7 +69,7 @@ def capture(url: str, timeout: int) -> Path:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Open Wellfound and save raw HTML to html_captures/ (and logs/debug/).")
+    ap = argparse.ArgumentParser(description="Open page and save raw HTML to html_captures/ (and logs/debug/).")
     ap.add_argument("--url", default=DEFAULT_URL, help=f"URL to load (default: {DEFAULT_URL})")
     ap.add_argument("--timeout", type=int, default=12, help="Load timeout seconds (default: 12)")
     args = ap.parse_args()
