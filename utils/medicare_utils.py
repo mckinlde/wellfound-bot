@@ -65,6 +65,17 @@ def wait_scroll_interact(driver, by, selector, action="click", keys=None, timeou
     return element
 
 
+# A safe click that can accept an element instead of requiring a by && selector
+def _safe_click_element(driver, element, settle_delay=1):
+    """Scroll a concrete WebElement into view and click it (JS fallback)."""
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+    sleep(settle_delay)
+    try:
+        element.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", element)
+
+        
 # -----------------------------------------------------
 # Medicare.gov scraping steps
 # -----------------------------------------------------
@@ -149,7 +160,7 @@ def scrape_plan_detail_page(driver, zipcode, base_dir=".", timeout=10):
     expanders = driver.find_elements(By.XPATH, "//span[contains(text(),'more benefits')] | //span[contains(text(),'extra benefits')]")
     for expander in expanders:
         try:
-            expander.click()
+            _safe_click_element(expander)
         except:
             pass
 
@@ -174,34 +185,69 @@ def scrape_plan_detail_page(driver, zipcode, base_dir=".", timeout=10):
 
 
 def scrape_all_plan_details(driver, zipcode, base_dir=".", timeout=10):
-    """Iterates through all search results pages and scrapes each plan detail."""
+    """Iterate all result pages; open each plan detail, scrape, go back, continue."""
     wait = WebDriverWait(driver, timeout)
     results = []
 
     page = 1
     while True:
+        # Wait for any plan details buttons to exist on this page
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'a.e2e-plan-details-btn')))
-        plan_links = driver.find_elements(By.CSS_SELECTOR, 'a.e2e-plan-details-btn')
 
-        for i in range(len(plan_links)):
-            plan_links = driver.find_elements(By.CSS_SELECTOR, 'a.e2e-plan-details-btn')
-            link = plan_links[i]
+        # Freeze the count for this page (pagination changes between pages only)
+        link_elems = driver.find_elements(By.CSS_SELECTOR, 'a.e2e-plan-details-btn')
+        total = len(link_elems)
 
-            wait_scroll_interact(driver, By.CSS_SELECTOR, 'a.e2e-plan-details-btn', action="click", timeout=timeout)
+        for i in range(total):
+            # Re-find fresh elements each iteration to avoid stale references
+            link_elems = driver.find_elements(By.CSS_SELECTOR, 'a.e2e-plan-details-btn')
+            if i >= len(link_elems):
+                break  # defensive: DOM changed unexpectedly
+
+            link_el = link_elems[i]
+
+            # Click the specific i-th element (not a generic selector)
+            _safe_click_element(driver, link_el)
+
+            # Wait for the plan details header to confirm navigation
+            try:
+                WebDriverWait(driver, timeout).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'h1.e2e-plan-details-plan-header'))
+                )
+            except TimeoutException:
+                # If navigation failed (e.g., intercepted click), try one more time
+                _safe_click_element(driver, link_el)
+                WebDriverWait(driver, timeout).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'h1.e2e-plan-details-plan-header'))
+                )
+
+            # Scrape and record
             details = scrape_plan_detail_page(driver, zipcode=zipcode, base_dir=base_dir, timeout=timeout)
             results.append(details)
 
+            # Go back to the results list and wait for buttons to reappear
             driver.back()
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'a.e2e-plan-details-btn')))
 
+        # Try to advance pagination
         try:
-            next_button = driver.find_element(By.CSS_SELECTOR, 'button.Pagination__next')
-            if not next_button.is_enabled():
+            # Keep a handle to detect staleness after clicking Next
+            before = driver.find_elements(By.CSS_SELECTOR, 'a.e2e-plan-details-btn')
+            first_before = before[0] if before else None
+
+            next_btn = driver.find_element(By.CSS_SELECTOR, 'button.Pagination__next')
+            if not next_btn.is_enabled():
                 break
-            wait_scroll_interact(driver, By.CSS_SELECTOR, 'button.Pagination__next', action="click")
+
+            _safe_click_element(driver, next_btn)
+
+            # Wait until the list actually updates
+            if first_before:
+                wait.until(EC.staleness_of(first_before))
             wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'a.e2e-plan-details-btn')))
             page += 1
-        except:
+        except Exception:
+            # No next button or navigation failed => last page
             break
 
     return results
