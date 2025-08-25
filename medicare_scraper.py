@@ -18,6 +18,7 @@ from utils.medicare_utils import (
     scrape_all_plan_details,
 )
 
+
 # -------------------------
 # CONFIG
 # -------------------------
