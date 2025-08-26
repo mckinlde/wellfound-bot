@@ -23,7 +23,7 @@ from utils.medicare_utils import (
 # -------------------------
 # CONFIG
 # -------------------------
-ZIPCODES_FILE = "constants/single_county_zips.csv"  # has cols: state,county,state_fips,zip_code
+ZIPCODES_FILE = "constants/single_county_zips_final_fixed.csv"  # has cols: state,county,state_fips,zip_code
 PLAN_CHOICES = ["mapd"]  # for now just medicare advantage
 PLAN_LINKS_CSV = "plan_links.csv"
 
