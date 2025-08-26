@@ -140,9 +140,8 @@ def collect_plan_detail_links(driver, timeout=10):
 
     return all_links
 
-
-def scrape_plan_detail_page(driver, zipcode, base_dir=".", timeout=10):
-    """Scrape plan detail page and save HTML snapshot."""
+def scrape_plan_detail_page(driver, zipcode, timeout=10):
+    """Scrape plan detail page (no HTML saving)."""
     wait = WebDriverWait(driver, timeout)
 
     header = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "h1.e2e-plan-details-plan-header")))
@@ -156,7 +155,9 @@ def scrape_plan_detail_page(driver, zipcode, base_dir=".", timeout=10):
     company = company_el.text.strip()
     plan_type = plan_type_el.text.strip()
     plan_id = plan_id_el.text.strip()
+    link_to_plan_page = driver.current_url  # <-- capture current URL
 
+    # Expand optional sections
     expanders = driver.find_elements(By.XPATH, "//span[contains(text(),'more benefits')] | //span[contains(text(),'extra benefits')]")
     for expander in expanders:
         try:
@@ -164,29 +165,17 @@ def scrape_plan_detail_page(driver, zipcode, base_dir=".", timeout=10):
         except:
             pass
 
-    output_dir = os.path.join(base_dir, "medicare_zncti")
-    os.makedirs(output_dir, exist_ok=True)
-
-    safe_plan_name = re.sub(r'\W+', '_', plan_name)
-    safe_company = re.sub(r'\W+', '_', company)
-    safe_plan_type = re.sub(r'\W+', '_', plan_type)
-    safe_plan_id = re.sub(r'\W+', '_', plan_id)
-    filename = f"z,{zipcode}_n,{safe_plan_name}_c,{safe_company}_t,{safe_plan_type}_i,{safe_plan_id}.html"
-    filepath = os.path.join(output_dir, filename)
-
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(driver.page_source)
-
     return {
         "plan_name": plan_name,
         "company": company,
         "plan_type": plan_type,
         "plan_id": plan_id,
-        "saved_file": filepath,
+        "link_to_plan_page": link_to_plan_page,
     }
 
 
-def scrape_all_plan_details(driver, zipcode, base_dir=".", timeout=10):
+
+def scrape_all_plan_details(driver, zipcode, timeout=10):
     sleep(1)
     """Iterate all result pages; open each plan detail, scrape, go back, continue."""
     wait = WebDriverWait(driver, timeout)
@@ -227,7 +216,7 @@ def scrape_all_plan_details(driver, zipcode, base_dir=".", timeout=10):
                 )
 
             # Scrape and record
-            details = scrape_plan_detail_page(driver, zipcode=zipcode, base_dir=base_dir, timeout=timeout)
+            details = scrape_plan_detail_page(driver, zipcode=zipcode, timeout=timeout)
             results.append(details)
 
             # Go back to the results list and wait for buttons to reappear
