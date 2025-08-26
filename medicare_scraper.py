@@ -19,6 +19,9 @@ from utils.medicare_utils import (
     select_exclude_and_next,
     scrape_all_plan_details,
 )
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 # -------------------------
 # CONFIG
@@ -57,6 +60,10 @@ def run_zipcode_plan(driver, zip_info, plan_type, progress_str, cumulative_plans
 
     # Load landing page fresh for each ZIP/plan
     driver.get("https://www.medicare.gov/plan-compare/#/?year=2025&lang=en")
+    # Wait up to 15s for the ZIP code input to appear
+    WebDriverWait(driver, 15).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "input#zipCode"))
+    )
 
     # Step 1: ZIP → Continue
     fill_zip_and_click_continue(driver, zipcode)
@@ -94,7 +101,6 @@ def run_zipcode_plan(driver, zip_info, plan_type, progress_str, cumulative_plans
 
     return cumulative_plans
 
-
 def main():
     # Load ZIP codes with full row dicts
     with open(ZIPCODES_FILE, newline="", encoding="utf-8") as f:
@@ -107,17 +113,18 @@ def main():
     print(f"[START] Processing {len(zip_infos)} ZIPs × {len(PLAN_CHOICES)} plans = {total_tasks} tasks")
     sys.stdout.flush()
 
-    with start_driver() as driver:
-        for zi, zip_info in enumerate(zip_infos, 1):
-            for pi, plan_type in enumerate(PLAN_CHOICES, 1):
-                completed += 1
-                progress_str = f"Task {completed}/{total_tasks} (ZIP {zi}/{len(zip_infos)}, Plan {pi}/{len(PLAN_CHOICES)})"
-                try:
+    for zi, zip_info in enumerate(zip_infos, 1):
+        for pi, plan_type in enumerate(PLAN_CHOICES, 1):
+            completed += 1
+            progress_str = f"Task {completed}/{total_tasks} (ZIP {zi}/{len(zip_infos)}, Plan {pi}/{len(PLAN_CHOICES)})"
+
+            try:
+                with start_driver() as driver:
                     cumulative_plans = run_zipcode_plan(driver, zip_info, plan_type, progress_str, cumulative_plans)
-                except Exception as e:
-                    print(f"[ERROR] {progress_str} | ZIP={zip_info['zip_code']}, plan={plan_type}: {e}")
-                    sys.stdout.flush()
-                    continue
+            except Exception as e:
+                print(f"[ERROR] {progress_str} | ZIP={zip_info['zip_code']}, plan={plan_type}: {e}")
+                sys.stdout.flush()
+                continue
 
     print(f"[COMPLETE] All {total_tasks} tasks finished. Total plans saved: {cumulative_plans}")
 
