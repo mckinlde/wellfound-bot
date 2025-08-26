@@ -18,6 +18,7 @@ from utils.medicare_utils import (
     select_none_and_continue,
     select_exclude_and_next,
     scrape_all_plan_details,
+    wait_scroll_interact,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -60,10 +61,12 @@ def run_zipcode_plan(driver, zip_info, plan_type, progress_str, cumulative_plans
 
     # Load landing page fresh for each ZIP/plan
     driver.get("https://www.medicare.gov/plan-compare/#/?year=2025&lang=en")
-    # Wait up to 15s for the ZIP code input to appear
-    WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "input#zipCode"))
-    )
+    # Defensive sleep
+    time.sleep(2)
+    
+    # scroll zip code field into view and click it
+    wait_scroll_interact(driver, By.CSS_SELECTOR, '[data-testid="coverage-selector-zipcode"]',
+                         action="click", keys="", timeout=10)
 
     # Step 1: ZIP → Continue
     fill_zip_and_click_continue(driver, zipcode)
