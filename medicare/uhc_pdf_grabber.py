@@ -154,7 +154,7 @@ def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
                     doc_type = normalize_pdf_name(text)
                     success = download_pdf(doc_type, link, plan_folder, req_sess)
                     if success:
-                        logger.info(f"Downloaded {doc_type} for plan {plan['plan_id']}")
+                        logger.info(f"Downloaded {doc_type} for plan {plan['plan_id']}, uhc_plan_links.csv row {idx} / {total}")
                         print(f"Downloaded {doc_type} for plan {plan['plan_id']}, uhc_plan_links.csv row {idx} / {total}")
 
 if __name__ == "__main__":
