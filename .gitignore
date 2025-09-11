@@ -9,3 +9,9 @@ html_captures/
 
 # Flake.lock
 *.lock
+
+# csv
+*.csv
+
+# pdf
+*.pdf
