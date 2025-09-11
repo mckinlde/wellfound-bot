@@ -130,6 +130,15 @@ def download_pdf(doc_type, url, plan_folder, session):
 def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
     os.makedirs(out_dir, exist_ok=True)
     session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/116.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.uhc.com/medicare/health-plans",
+    })
+
 
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = list(csv.DictReader(f))
