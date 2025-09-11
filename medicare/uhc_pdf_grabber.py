@@ -79,29 +79,59 @@ def make_requests_session_from_driver(driver):
     })
     return s
 
+
+def categorize_pdf(text):
+    txt = text.lower()
+    if "summary of benefits" in txt:
+        return "Summary_of_Benefits"
+    elif "evidence of coverage" in txt:
+        return "Evidence_of_Coverage"
+    elif "formulary" in txt or "drug list" in txt:
+        return "Drug_Formulary"
+    else:
+        return "Other"
+
 # -----------------------
 # Core logic
 # -----------------------
-def fetch_pdfs(plan, driver):
-    """Use Selenium to scrape all PDF links from a UHC plan page."""
-    try:
-        url = build_uhc_url_from_medicare_link(plan["link_to_plan_page"])
-    except ValueError as e:
-        logger.error(str(e))
-        return []
-
+def fetch_pdfs(plan, plan_id_fmt, session):
+    """Scrape all PDF links from UHC plan page."""
+    url = build_uhc_url(plan, plan_id_fmt)
     logger.info(f"🌐 Fetching {url}")
 
-    soup = get_soup_from_url(driver, url, extra_settle_seconds=3)
-    if not soup:
+    try:
+        r = session.get(url, timeout=20)
+        r.raise_for_status()
+        time.sleep(random.uniform(1, 3))  # politeness
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch {url}: {e}")
         return []
 
+    soup = BeautifulSoup(r.text, "html.parser")
     pdf_links = []
-    for a in soup.find_all("a", href=True):
-        href = urljoin(url, a["href"])
-        if href.lower().endswith(".pdf"):
-            text = a.get_text(strip=True) or "document"
-            pdf_links.append((text, href))
+
+    # Prefer structured divs with metadata
+    for div in soup.find_all("div", class_="document-link"):
+        pdf_name = div.get("data-pdf-name", "").strip().lower()
+        a = div.find("a", href=True)
+        if not a:
+            continue
+        href = a["href"]
+
+        if href.lower().endswith(".pdf") or "/medicare/" in href:
+            # UHC sometimes gives relative links
+            if href.startswith("/"):
+                href = "https://www.uhc.com" + href
+
+            pdf_links.append((pdf_name, href))
+
+    # fallback: generic <a> ending with .pdf
+    if not pdf_links:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.lower().endswith(".pdf"):
+                pdf_links.append((a.get_text(strip=True), href))
+
     return pdf_links
 
 def download_pdf(doc_type, url, plan_folder, req_sess):
@@ -141,21 +171,17 @@ def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
                 plan_folder = os.path.join(out_dir, plan["plan_id"])
                 os.makedirs(plan_folder, exist_ok=True)
 
-                pdfs = fetch_pdfs(plan, driver)
+                # build the 11-char plan id
+                plan_id_fmt = build_uhc_url_from_medicare_link(plan["link_to_plan_page"]).split("/")[-2]
 
                 # create a requests.Session with Selenium’s cookies
                 req_sess = make_requests_session_from_driver(driver)
 
-                for text, link in pdfs:
-                    if any(key in text.lower() for key in ["summary of benefits", "sob"]):
-                        doc_type = "Summary_of_Benefits"
-                    elif any(key in text.lower() for key in ["evidence of coverage", "eoc"]):
-                        doc_type = "Evidence_of_Coverage"
-                    elif any(key in text.lower() for key in ["formulary", "drug list"]):
-                        doc_type = "Drug_Formulary"
-                    else:
-                        doc_type = "Other"
+                # fetch PDFs using the requests session
+                pdfs = fetch_pdfs(plan, plan_id_fmt, req_sess)
 
+                for text, link in pdfs:
+                    doc_type = categorize_pdf(text)
                     success = download_pdf(doc_type, link, plan_folder, req_sess)
                     if success:
                         logger.info(f"Downloaded {doc_type} for plan {plan['plan_id']}")
