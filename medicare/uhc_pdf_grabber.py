@@ -5,9 +5,8 @@ import time
 import random
 import requests
 import logging
-import pandas as pd
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
 
 # -----------------------
 # Logging setup
@@ -21,57 +20,73 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # -----------------------
 # Helpers
 # -----------------------
-def format_plan_id(plan_id: str) -> str:
+def build_uhc_url_from_medicare_link(link: str) -> str:
     """
-    Convert CMS-style plan IDs (Hxxxx-yyy-z) into UHC 11-digit format.
-    Examples:
-        H2001-088-1 -> H2001088001
-        H5253-141-0 -> H5253141000
-        H2802-041-0 -> H2802041000
+    Construct the UHC plan details URL from a Medicare.gov plan link.
+    Uses ONLY the Medicare link as source of truth.
+
+    Format:
+      https://www.uhc.com/medicare/health-plans/details.html/{zip}/{fips3}/{plan_code11}/{year}
     """
-    parts = plan_id.split("-")
-    if len(parts) != 3:
-        raise ValueError(f"Unexpected plan_id format: {plan_id}")
-    
-    contract, plan_num, segment = parts
-    plan_num = plan_num.zfill(3)   # ensure 3 digits
-    segment = segment.zfill(2)     # ensure 2 digits
-    raw = f"{contract}{plan_num}{segment}"
-    
-    # ensure length = 11, pad with trailing zeros if needed
-    return raw.ljust(11, "0")
+    parsed = urlparse(link)
 
+    # Medicare puts params after '#'
+    frag = parsed.fragment or ""
+    frag_path, frag_query = (frag.split("?", 1) + [""])[:2] if "?" in frag else (frag, "")
+    q_frag = parse_qs(frag_query)
+    q_main = parse_qs(parsed.query)
 
-def extract_uhc_state_fips(link: str) -> str:
-    """Extract the last 3 digits of fips from Medicare.gov link_to_plan_page."""
-    qs = parse_qs(urlparse(link).query)
-    fips_val = qs.get("fips", [""])[0]  # e.g. "01003"
-    return fips_val[-3:].zfill(3)       # e.g. "003"
+    def get_param(name, default=None):
+        if name in q_frag and q_frag[name]:
+            return q_frag[name][0]
+        if name in q_main and q_main[name]:
+            return q_main[name][0]
+        return default
 
+    zip_code = get_param("zip")
+    fips_full = get_param("fips")
+    year_param = get_param("year")
 
-def build_uhc_url(plan: dict, plan_id_fmt: str) -> str:
-    zip_code = str(plan["zip"])
-    state_fips = extract_uhc_state_fips(str(plan["link_to_plan_page"]))
-    year = "2025"
-    return f"https://www.uhc.com/medicare/health-plans/details.html/{zip_code}/{state_fips}/{plan_id_fmt}/{year}"
+    # Parse path for year/contract/plan/segment
+    m = re.search(r"plan-details/(\d{4})-([A-Z]\d{4})-(\d{3})-(\d{1,2})", frag_path, re.I)
+    if not m:
+        m = re.search(r"(\d{4})-([A-Z]\d{4})-(\d{3})-(\d{1,2})", link, re.I)
+    if not m:
+        raise ValueError(f"Could not parse plan identifier from link: {link}")
 
+    year_from_path, contract, plan3, segment = m.groups()
+    year = year_param or year_from_path
+
+    if not zip_code or not fips_full or not year:
+        raise ValueError(f"Missing zip/fips/year in link: {link}")
+
+    fips3 = str(fips_full)[-3:].zfill(3)
+    plan3 = plan3.zfill(3)
+    seg3  = str(segment).zfill(3)
+    plan_code11 = f"{contract.upper()}{plan3}{seg3}"
+
+    return f"https://www.uhc.com/medicare/health-plans/details.html/{zip_code}/{fips3}/{plan_code11}/{year}"
 
 # -----------------------
 # Core logic
 # -----------------------
-def fetch_pdfs(plan, plan_id_fmt, session):
-    """Scrape all PDF links from UHC plan page."""
-    url = build_uhc_url(plan, plan_id_fmt)
+def fetch_pdfs(plan, session):
+    """Scrape all PDF links from a UHC plan page."""
+    try:
+        url = build_uhc_url_from_medicare_link(plan["link_to_plan_page"])
+    except ValueError as e:
+        logger.error(str(e))
+        return []
+
     logger.info(f"🌐 Fetching {url}")
 
     try:
         r = session.get(url, timeout=20)
         r.raise_for_status()
-        time.sleep(random.uniform(1, 3))  # politeness
+        time.sleep(random.uniform(1, 3))
     except Exception as e:
         logger.error(f"❌ Failed to fetch {url}: {e}")
         return []
@@ -79,31 +94,34 @@ def fetch_pdfs(plan, plan_id_fmt, session):
     soup = BeautifulSoup(r.text, "html.parser")
     pdf_links = []
     for a in soup.find_all("a", href=True):
-        href = a["href"]
+        href = urljoin(url, a["href"])  # ensure absolute URL
         if href.lower().endswith(".pdf"):
-            text = a.get_text(strip=True)
+            text = a.get_text(strip=True) or "document"
             pdf_links.append((text, href))
     return pdf_links
 
-def download_pdf(name, url, plan_id_fmt, plan_folder, session):
-    """Download one PDF, skip if already exists."""
-    try:
-        safe_name = re.sub(r'[^A-Za-z0-9_-]', '_', name)
-        fname = f"{safe_name}.pdf"
+def download_pdf(doc_type, url, plan_folder, session):
+    """Download one PDF with safe naming, avoid overwrites, skip if exists."""
+    safe_name = re.sub(r'[^A-Za-z0-9_-]', '_', doc_type) or "document"
+    fname = f"{safe_name}.pdf"
+    fpath = os.path.join(plan_folder, fname)
+
+    # If filename already exists, append suffix
+    counter = 1
+    base, ext = os.path.splitext(fpath)
+    while os.path.exists(fpath):
+        fname = f"{safe_name}_{counter}.pdf"
         fpath = os.path.join(plan_folder, fname)
+        counter += 1
 
-        if os.path.exists(fpath):
-            logger.info(f"⏩ Skipping {fname}, already exists.")
-            return False
-
+    try:
         r = session.get(url, stream=True, timeout=20)
         r.raise_for_status()
         with open(fpath, "wb") as f:
             for chunk in r.iter_content(8192):
                 f.write(chunk)
-
         logger.info(f"✅ Saved {fpath}")
-        time.sleep(random.uniform(1, 3))  # politeness
+        time.sleep(random.uniform(1, 3))
         return True
     except Exception as e:
         logger.error(f"❌ Failed {url}: {e}")
@@ -118,13 +136,12 @@ def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
         total = len(reader)
 
         for idx, plan in enumerate(reader, start=1):
-            plan_id_fmt = format_plan_id(plan["plan_id"])
             plan_folder = os.path.join(out_dir, plan["plan_id"])
             os.makedirs(plan_folder, exist_ok=True)
 
-            pdfs = fetch_pdfs(plan, plan_id_fmt, session)
+            pdfs = fetch_pdfs(plan, session)
             for text, link in pdfs:
-                # categorize document type
+                # categorize
                 if any(key in text.lower() for key in ["summary of benefits", "sob"]):
                     doc_type = "Summary_of_Benefits"
                 elif any(key in text.lower() for key in ["evidence of coverage", "eoc"]):
@@ -134,7 +151,7 @@ def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
                 else:
                     doc_type = "Other"
 
-                success = download_pdf(doc_type, link, plan_id_fmt, plan_folder, session)
+                success = download_pdf(doc_type, link, plan_folder, session)
                 if success:
                     logger.info(f"Downloaded {doc_type} for plan {plan['plan_id']}")
                     print(f"Downloaded {doc_type} for plan {plan['plan_id']}, uhc_plan_links.csv row {idx} / {total}")
