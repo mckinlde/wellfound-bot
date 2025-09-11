@@ -6,9 +6,9 @@ import random
 import logging
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs, urljoin
+from urllib.parse import urlparse, parse_qs
 
-from utils.driver_session import start_driver, get_soup_from_url
+from utils.driver_session import start_driver
 
 # -----------------------
 # Logging setup
@@ -64,13 +64,10 @@ def build_uhc_url_from_medicare_link(link: str) -> str:
 
     return f"https://www.uhc.com/medicare/health-plans/details.html/{zip_code}/{fips3}/{plan_code11}/{year}"
 
-
 def make_requests_session_from_driver(driver):
     s = requests.Session()
-    # copy cookies from Selenium into requests
     for c in driver.get_cookies():
         s.cookies.set(c['name'], c['value'])
-    # match browser headers
     s.headers.update({
         "User-Agent": driver.execute_script("return navigator.userAgent;"),
         "Referer": "https://www.uhc.com/medicare/health-plans",
@@ -79,58 +76,35 @@ def make_requests_session_from_driver(driver):
     })
     return s
 
-
-def categorize_pdf(text):
-    txt = text.lower()
+def normalize_pdf_name(raw_name: str) -> str:
+    """Clean UHC's data-pdf-name into a stable category."""
+    txt = raw_name.lower()
+    txt = re.sub(r"\(.*?\)", "", txt).strip()
     if "summary of benefits" in txt:
         return "Summary_of_Benefits"
     elif "evidence of coverage" in txt:
         return "Evidence_of_Coverage"
     elif "formulary" in txt or "drug list" in txt:
         return "Drug_Formulary"
-    else:
-        return "Other"
+    return "Other"
 
 # -----------------------
 # Core logic
 # -----------------------
-def fetch_pdfs(plan, plan_id_fmt, session):
-    """Scrape all PDF links from UHC plan page."""
-    url = build_uhc_url(plan, plan_id_fmt)
-    logger.info(f"🌐 Fetching {url}")
-
-    try:
-        r = session.get(url, timeout=20)
-        r.raise_for_status()
-        time.sleep(random.uniform(1, 3))  # politeness
-    except Exception as e:
-        logger.error(f"❌ Failed to fetch {url}: {e}")
-        return []
-
-    soup = BeautifulSoup(r.text, "html.parser")
+def fetch_pdfs(driver):
+    """Scrape all PDF links from the current Selenium page."""
+    soup = BeautifulSoup(driver.page_source, "html.parser")
     pdf_links = []
 
-    # Prefer structured divs with metadata
     for div in soup.find_all("div", class_="document-link"):
-        pdf_name = div.get("data-pdf-name", "").strip().lower()
+        pdf_name = div.get("data-pdf-name", "").strip()
         a = div.find("a", href=True)
         if not a:
             continue
         href = a["href"]
-
-        if href.lower().endswith(".pdf") or "/medicare/" in href:
-            # UHC sometimes gives relative links
-            if href.startswith("/"):
-                href = "https://www.uhc.com" + href
-
-            pdf_links.append((pdf_name, href))
-
-    # fallback: generic <a> ending with .pdf
-    if not pdf_links:
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.lower().endswith(".pdf"):
-                pdf_links.append((a.get_text(strip=True), href))
+        if href.startswith("/"):
+            href = "https://www.uhc.com" + href
+        pdf_links.append((pdf_name, href))
 
     return pdf_links
 
@@ -139,12 +113,10 @@ def download_pdf(doc_type, url, plan_folder, req_sess):
     fname = f"{safe_name}.pdf"
     fpath = os.path.join(plan_folder, fname)
 
-    counter = 1
-    base, ext = os.path.splitext(fpath)
-    while os.path.exists(fpath):
-        fname = f"{safe_name}_{counter}.pdf"
-        fpath = os.path.join(plan_folder, fname)
-        counter += 1
+    # skip if already downloaded
+    if os.path.exists(fpath):
+        logger.info(f"⏩ Skipping {fpath}, already exists.")
+        return False
 
     try:
         r = req_sess.get(url, stream=True, timeout=20)
@@ -171,17 +143,15 @@ def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
                 plan_folder = os.path.join(out_dir, plan["plan_id"])
                 os.makedirs(plan_folder, exist_ok=True)
 
-                # build the 11-char plan id
-                plan_id_fmt = build_uhc_url_from_medicare_link(plan["link_to_plan_page"]).split("/")[-2]
+                url = build_uhc_url_from_medicare_link(plan["link_to_plan_page"])
+                driver.get(url)
+                time.sleep(2)  # let page load JS
 
-                # create a requests.Session with Selenium’s cookies
+                pdfs = fetch_pdfs(driver)
                 req_sess = make_requests_session_from_driver(driver)
 
-                # fetch PDFs using the requests session
-                pdfs = fetch_pdfs(plan, plan_id_fmt, req_sess)
-
                 for text, link in pdfs:
-                    doc_type = categorize_pdf(text)
+                    doc_type = normalize_pdf_name(text)
                     success = download_pdf(doc_type, link, plan_folder, req_sess)
                     if success:
                         logger.info(f"Downloaded {doc_type} for plan {plan['plan_id']}")
