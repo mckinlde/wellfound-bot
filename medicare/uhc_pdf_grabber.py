@@ -3,10 +3,11 @@ import re
 import csv
 import time
 import random
-import requests
 import logging
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs, urljoin
+
+from utils.driver_session import start_driver, get_soup_from_url
 
 # -----------------------
 # Logging setup
@@ -26,14 +27,8 @@ logger = logging.getLogger(__name__)
 def build_uhc_url_from_medicare_link(link: str) -> str:
     """
     Construct the UHC plan details URL from a Medicare.gov plan link.
-    Uses ONLY the Medicare link as source of truth.
-
-    Format:
-      https://www.uhc.com/medicare/health-plans/details.html/{zip}/{fips3}/{plan_code11}/{year}
     """
     parsed = urlparse(link)
-
-    # Medicare puts params after '#'
     frag = parsed.fragment or ""
     frag_path, frag_query = (frag.split("?", 1) + [""])[:2] if "?" in frag else (frag, "")
     q_frag = parse_qs(frag_query)
@@ -50,7 +45,6 @@ def build_uhc_url_from_medicare_link(link: str) -> str:
     fips_full = get_param("fips")
     year_param = get_param("year")
 
-    # Parse path for year/contract/plan/segment
     m = re.search(r"plan-details/(\d{4})-([A-Z]\d{4})-(\d{3})-(\d{1,2})", frag_path, re.I)
     if not m:
         m = re.search(r"(\d{4})-([A-Z]\d{4})-(\d{3})-(\d{1,2})", link, re.I)
@@ -59,7 +53,6 @@ def build_uhc_url_from_medicare_link(link: str) -> str:
 
     year_from_path, contract, plan3, segment = m.groups()
     year = year_param or year_from_path
-
     if not zip_code or not fips_full or not year:
         raise ValueError(f"Missing zip/fips/year in link: {link}")
 
@@ -73,8 +66,8 @@ def build_uhc_url_from_medicare_link(link: str) -> str:
 # -----------------------
 # Core logic
 # -----------------------
-def fetch_pdfs(plan, session):
-    """Scrape all PDF links from a UHC plan page."""
+def fetch_pdfs(plan, driver):
+    """Use Selenium to scrape all PDF links from a UHC plan page."""
     try:
         url = build_uhc_url_from_medicare_link(plan["link_to_plan_page"])
     except ValueError as e:
@@ -83,30 +76,24 @@ def fetch_pdfs(plan, session):
 
     logger.info(f"🌐 Fetching {url}")
 
-    try:
-        r = session.get(url, timeout=20)
-        r.raise_for_status()
-        time.sleep(random.uniform(1, 3))
-    except Exception as e:
-        logger.error(f"❌ Failed to fetch {url}: {e}")
+    soup = get_soup_from_url(driver, url, extra_settle_seconds=3)
+    if not soup:
         return []
 
-    soup = BeautifulSoup(r.text, "html.parser")
     pdf_links = []
     for a in soup.find_all("a", href=True):
-        href = urljoin(url, a["href"])  # ensure absolute URL
+        href = urljoin(url, a["href"])
         if href.lower().endswith(".pdf"):
             text = a.get_text(strip=True) or "document"
             pdf_links.append((text, href))
     return pdf_links
 
-def download_pdf(doc_type, url, plan_folder, session):
+def download_pdf(doc_type, url, plan_folder):
     """Download one PDF with safe naming, avoid overwrites, skip if exists."""
     safe_name = re.sub(r'[^A-Za-z0-9_-]', '_', doc_type) or "document"
     fname = f"{safe_name}.pdf"
     fpath = os.path.join(plan_folder, fname)
 
-    # If filename already exists, append suffix
     counter = 1
     base, ext = os.path.splitext(fpath)
     while os.path.exists(fpath):
@@ -115,7 +102,8 @@ def download_pdf(doc_type, url, plan_folder, session):
         counter += 1
 
     try:
-        r = session.get(url, stream=True, timeout=20)
+        import requests
+        r = requests.get(url, stream=True, timeout=20)
         r.raise_for_status()
         with open(fpath, "wb") as f:
             for chunk in r.iter_content(8192):
@@ -129,41 +117,31 @@ def download_pdf(doc_type, url, plan_folder, session):
 
 def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
     os.makedirs(out_dir, exist_ok=True)
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/116.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.uhc.com/medicare/health-plans",
-    })
-
 
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = list(csv.DictReader(f))
         total = len(reader)
 
-        for idx, plan in enumerate(reader, start=1):
-            plan_folder = os.path.join(out_dir, plan["plan_id"])
-            os.makedirs(plan_folder, exist_ok=True)
+        with start_driver(headless=True) as driver:
+            for idx, plan in enumerate(reader, start=1):
+                plan_folder = os.path.join(out_dir, plan["plan_id"])
+                os.makedirs(plan_folder, exist_ok=True)
 
-            pdfs = fetch_pdfs(plan, session)
-            for text, link in pdfs:
-                # categorize
-                if any(key in text.lower() for key in ["summary of benefits", "sob"]):
-                    doc_type = "Summary_of_Benefits"
-                elif any(key in text.lower() for key in ["evidence of coverage", "eoc"]):
-                    doc_type = "Evidence_of_Coverage"
-                elif any(key in text.lower() for key in ["formulary", "drug list"]):
-                    doc_type = "Drug_Formulary"
-                else:
-                    doc_type = "Other"
+                pdfs = fetch_pdfs(plan, driver)
+                for text, link in pdfs:
+                    if any(key in text.lower() for key in ["summary of benefits", "sob"]):
+                        doc_type = "Summary_of_Benefits"
+                    elif any(key in text.lower() for key in ["evidence of coverage", "eoc"]):
+                        doc_type = "Evidence_of_Coverage"
+                    elif any(key in text.lower() for key in ["formulary", "drug list"]):
+                        doc_type = "Drug_Formulary"
+                    else:
+                        doc_type = "Other"
 
-                success = download_pdf(doc_type, link, plan_folder, session)
-                if success:
-                    logger.info(f"Downloaded {doc_type} for plan {plan['plan_id']}")
-                    print(f"Downloaded {doc_type} for plan {plan['plan_id']}, uhc_plan_links.csv row {idx} / {total}")
+                    success = download_pdf(doc_type, link, plan_folder)
+                    if success:
+                        logger.info(f"Downloaded {doc_type} for plan {plan['plan_id']}")
+                        print(f"Downloaded {doc_type} for plan {plan['plan_id']}, uhc_plan_links.csv row {idx} / {total}")
 
 if __name__ == "__main__":
     download_plan_pdfs("medicare/uhc_plan_links.csv")
