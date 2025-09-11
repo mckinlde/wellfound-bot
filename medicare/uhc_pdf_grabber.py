@@ -4,6 +4,7 @@ import csv
 import time
 import random
 import logging
+import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs, urljoin
 
@@ -63,6 +64,21 @@ def build_uhc_url_from_medicare_link(link: str) -> str:
 
     return f"https://www.uhc.com/medicare/health-plans/details.html/{zip_code}/{fips3}/{plan_code11}/{year}"
 
+
+def make_requests_session_from_driver(driver):
+    s = requests.Session()
+    # copy cookies from Selenium into requests
+    for c in driver.get_cookies():
+        s.cookies.set(c['name'], c['value'])
+    # match browser headers
+    s.headers.update({
+        "User-Agent": driver.execute_script("return navigator.userAgent;"),
+        "Referer": "https://www.uhc.com/medicare/health-plans",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return s
+
 # -----------------------
 # Core logic
 # -----------------------
@@ -88,8 +104,7 @@ def fetch_pdfs(plan, driver):
             pdf_links.append((text, href))
     return pdf_links
 
-def download_pdf(doc_type, url, plan_folder):
-    """Download one PDF with safe naming, avoid overwrites, skip if exists."""
+def download_pdf(doc_type, url, plan_folder, req_sess):
     safe_name = re.sub(r'[^A-Za-z0-9_-]', '_', doc_type) or "document"
     fname = f"{safe_name}.pdf"
     fpath = os.path.join(plan_folder, fname)
@@ -102,8 +117,7 @@ def download_pdf(doc_type, url, plan_folder):
         counter += 1
 
     try:
-        import requests
-        r = requests.get(url, stream=True, timeout=20)
+        r = req_sess.get(url, stream=True, timeout=20)
         r.raise_for_status()
         with open(fpath, "wb") as f:
             for chunk in r.iter_content(8192):
@@ -128,6 +142,10 @@ def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
                 os.makedirs(plan_folder, exist_ok=True)
 
                 pdfs = fetch_pdfs(plan, driver)
+
+                # create a requests.Session with Selenium’s cookies
+                req_sess = make_requests_session_from_driver(driver)
+
                 for text, link in pdfs:
                     if any(key in text.lower() for key in ["summary of benefits", "sob"]):
                         doc_type = "Summary_of_Benefits"
@@ -138,7 +156,7 @@ def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
                     else:
                         doc_type = "Other"
 
-                    success = download_pdf(doc_type, link, plan_folder)
+                    success = download_pdf(doc_type, link, plan_folder, req_sess)
                     if success:
                         logger.info(f"Downloaded {doc_type} for plan {plan['plan_id']}")
                         print(f"Downloaded {doc_type} for plan {plan['plan_id']}, uhc_plan_links.csv row {idx} / {total}")
