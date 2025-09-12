@@ -53,3 +53,7 @@ I can send full text of the python files if you need them.
 No, the script you just wrote is great; all I want you to change is to use these helper functions from 'SPA_Utils.py' to harden it from bot detection and be polite with Aetna's servers.
 
 <.py>
+
+-------------------------------------------------------------------------------------------------------------------
+
+No, I think direct downloads will work.  I would like you to add some indication of progress though, like a print statement showing which plan_id we're on out of the total.  I'd also like to be able to pass a start and stop plan_id as a CLI to pick up where I left off after any crashes, and not redo work I've already done.
