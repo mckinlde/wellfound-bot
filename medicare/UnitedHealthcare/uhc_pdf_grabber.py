@@ -139,7 +139,7 @@ def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
         total = len(reader)
 
         with start_driver(headless=True) as driver:
-            start_row = 883  # resume here
+            start_row = 5940  # resume here, TODO: command-line arg for reruns at scale
             for idx, plan in enumerate(reader, start=1):
                 if idx < start_row:
                     continue  # skip until the starting row
