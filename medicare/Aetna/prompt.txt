@@ -48,3 +48,8 @@ AL,Baldwin,1,36507,Aetna Medicare,Aetna Medicare Value Plus (PPO),Medicare Advan
 
 I can send full text of the python files if you need them.
 
+-------------------------------------------------------------------------------------------------------------------
+
+No, the script you just wrote is great; all I want you to change is to use these helper functions from 'SPA_Utils.py' to harden it from bot detection and be polite with Aetna's servers.
+
+<.py>
