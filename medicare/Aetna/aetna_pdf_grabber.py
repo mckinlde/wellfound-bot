@@ -68,23 +68,35 @@ def scrape_plan_pdfs(driver, plan_id: str) -> dict:
     print(f"[INFO] Visiting {url}")
     driver.get(url)
 
-    # If CAPTCHA page shows, pause until user confirms
-    if "validate" in driver.page_source.lower() or "captcha" in driver.page_source.lower():
-        input("[ACTION] CAPTCHA detected. Please solve it in the browser window, then press Enter here to continue...")
+    # Loop until the real plan page loads (not CAPTCHA)
+    while True:
+        page_source = driver.page_source.lower()
 
-    sleep(2)  # polite settle
+        if "captcha" in page_source or "validate" in page_source:
+            input("[ACTION] CAPTCHA detected. Solve it in the browser, then press Enter here to continue...")
+            sleep(2)
+            # re-check after you solve
+            continue
+
+        # Try grabbing links
+        elements = driver.find_elements(By.CSS_SELECTOR, "a.type__link__digitaldownload")
+        if elements:
+            break  # success, we’re on a real plan page
+
+        # No elements, might still be loading or blocked
+        print("    [WARN] No links yet, waiting...")
+        sleep(2)
+
     pdfs = {}
-    for el in driver.find_elements(By.CSS_SELECTOR, "a.type__link__digitaldownload"):
+    for el in elements:
         try:
             label = (el.get_attribute("data-analytics-name") or "").strip()
             href = (el.get_attribute("href") or "").strip()
-            if not label or not href:
-                continue
             if label in DOC_LABELS and href.lower().endswith(".pdf"):
-                # Ensure absolute URL (site often uses /medicare/documents/...)
                 pdfs[label] = urljoin(BASE_ORIGIN, href)
         except Exception:
             continue
+
     return pdfs
 
 
