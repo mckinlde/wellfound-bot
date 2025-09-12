@@ -139,7 +139,12 @@ def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
         total = len(reader)
 
         with start_driver(headless=True) as driver:
+            start_row = 883  # resume here
             for idx, plan in enumerate(reader, start=1):
+                if idx < start_row:
+                    continue  # skip until the starting row
+                logger.info(f"Processing plan {plan['plan_id']} ({idx}/{total})")
+                print(f"Processing plan {plan['plan_id']} ({idx}/{total})")
                 plan_folder = os.path.join(out_dir, plan["plan_id"])
                 os.makedirs(plan_folder, exist_ok=True)
 
@@ -154,8 +159,8 @@ def download_plan_pdfs(csv_path, out_dir="uhc_plan_pdfs"):
                     doc_type = normalize_pdf_name(text)
                     success = download_pdf(doc_type, link, plan_folder, req_sess)
                     if success:
-                        logger.info(f"Downloaded {doc_type} for plan {plan['plan_id']}, uhc_plan_links.csv row {idx} / {total}")
-                        print(f"Downloaded {doc_type} for plan {plan['plan_id']}, uhc_plan_links.csv row {idx} / {total}")
+                        logger.info(f"Downloaded {doc_type} for plan {plan['plan_id']}")
+                        print(f"Downloaded {doc_type} for plan {plan['plan_id']}")
 
 if __name__ == "__main__":
     download_plan_pdfs("medicare/uhc_plan_links.csv")
