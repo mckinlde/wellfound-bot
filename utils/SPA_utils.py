@@ -1,5 +1,6 @@
 import re
 import os
+import requests
 from time import sleep
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -10,6 +11,7 @@ Utility functions for Single Page Application (SPA) interactions using Selenium.
 Includes:
 - wait_scroll_interact: Wait for an element, scroll into view, and interact safely.
 - _safe_click_element: Scroll a concrete WebElement into view and click it (JS fallback).
+- make_requests_session_from_driver: Create a requests session from a selenium driver (to share cookies and headers).
 """
 
 
@@ -71,3 +73,15 @@ def _safe_click_element(driver, element, settle_delay=1):
         driver.execute_script("arguments[0].click();", element)
 
         
+# Create a requests session from a selenium driver (to share cookies and headers)
+def make_requests_session_from_driver(driver):
+    s = requests.Session()
+    for c in driver.get_cookies():
+        s.cookies.set(c['name'], c['value'])
+    s.headers.update({
+        "User-Agent": driver.execute_script("return navigator.userAgent;"),
+        "Referer": "https://www.uhc.com/medicare/health-plans",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return s

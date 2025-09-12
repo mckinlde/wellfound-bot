@@ -1,0 +1,50 @@
+Got it; fixed!
+
+I want to write a file 'aetna_pdf_grabber.py' to save PDFs from Aetna's medicare advantage plan details page.
+
+Governing goal:  I want to save PDF files for each of the:
+    Summary of Benefits (SB)
+    Summary of Benefits (SB) - Español
+    Evidence of Coverage (EOC)
+    Evidence of Coverage (EOC) - Español
+    Formulary (drug list)
+    Formulary (drug list) - Español
+    Annual Notice of Change (ANOC)
+    Annual Notice of Change (ANOC) - Español
+
+Those files are on pages with URL formats like:
+    https://www.aetna.com/medicare/plan.H5521.160.html
+    https://www.aetna.com/medicare/plan.H5521.475.html
+    https://www.aetna.com/medicare/plan.H2663.039.html
+
+And in Elements that look like:
+```
+<a href="/medicare/documents/individual/2025/summaryofbenefits/Y0001_H2663_039_HP61_SB2025_M.pdf" type="" class="type__link__digitaldownload" data-modal="Please Select" data-linktype="Download" target="_blank" rel="noopener noreferrer" data-analytics-name="Summary of Benefits (SB)" data-linklocation="discoverable">
+      <span class="link__digitaldownload">Summary of Benefits (SB)</span>
+    </a>
+```
+```
+<a href="/medicare/documents/individual/2025/eoc/Y0001_H2663_039_HP61_EOC2025_C.pdf" type="" class="type__link__digitaldownload" data-modal="Please Select" data-linktype="Download" target="_blank" rel="noopener noreferrer" data-analytics-name="Evidence of Coverage (EOC)" data-linklocation="discoverable">
+      <span class="link__digitaldownload">Evidence of Coverage (EOC)</span>
+    </a>
+```
+```
+<a href="/medicare/documents/individual/2025/formularies/FORM_2025_25101B25zHMO_EN.pdf" type="" class="type__link__digitaldownload" data-modal="Please Select" data-linktype="Download" target="_blank" rel="noopener noreferrer" data-analytics-name="Formulary (drug list)" data-linklocation="discoverable">
+      <span class="link__digitaldownload">Formulary (drug list)</span>
+    </a>
+```
+
+To help with this, I have a .csv file 'aetna_plan_links.csv' of plans and two python files; 'driver_session.py' to manage a webdriver session, and 'SPA_utils.py' with helper functions.
+
+The aetna_plan_links.csv file looks like this:
+```
+state,county,state_fips,zip,company,plan_name,plan_type,plan_id,link_to_plan_page
+AL,Baldwin,1,36507,Aetna Medicare,Aetna Medicare Eagle (PPO),Medicare Advantage (without drug coverage),H5521-229-0,https://www.medicare.gov/plan-compare/#/plan-details/2025-H5521-229-0?fips=01003&plan_type=PLAN_TYPE_MAPD&zip=36507&year=2025&lang=en&page=1
+AL,Baldwin,1,36507,Aetna Medicare,Aetna Medicare Freedom (PPO),Medicare Advantage with drug coverage,H5521-116-0,https://www.medicare.gov/plan-compare/#/plan-details/2025-H5521-116-0?fips=01003&plan_type=PLAN_TYPE_MAPD&zip=36507&year=2025&lang=en&page=1
+AL,Baldwin,1,36507,Aetna Medicare,Aetna Medicare Giveback Choice (PPO),Medicare Advantage with drug coverage,H5521-475-0,https://www.medicare.gov/plan-compare/#/plan-details/2025-H5521-475-0?fips=01003&plan_type=PLAN_TYPE_MAPD&zip=36507&year=2025&lang=en&page=1
+AL,Baldwin,1,36507,Aetna Medicare,Aetna Medicare Signature (HMO),Medicare Advantage with drug coverage,H3239-020-0,https://www.medicare.gov/plan-compare/#/plan-details/2025-H3239-020-0?fips=01003&plan_type=PLAN_TYPE_MAPD&zip=36507&year=2025&lang=en&page=2
+AL,Baldwin,1,36507,Aetna Medicare,Aetna Medicare Value Plus (PPO),Medicare Advantage with drug coverage,H5521-467-0,https://www.medicare.gov/plan-compare/#/plan-details/2025-H5521-467-0?fips=01003&plan_type=PLAN_TYPE_MAPD&zip=36507&year=2025&lang=en&page=3
+```
+
+I can send full text of the python files if you need them.
+
