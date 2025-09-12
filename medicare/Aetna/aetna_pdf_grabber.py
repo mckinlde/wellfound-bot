@@ -21,6 +21,11 @@ from urllib.parse import urljoin
 import pandas as pd
 from selenium.webdriver.common.by import By
 
+# if you want to keep relative imports
+# If you always run the script directly (python medicare/Aetna/aetna_pdf_grabber.py from the project root), you can instead do:
+import sys, os
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+# That forces Python to see the project root, no matter where you launch from.
 from utils.driver_session import start_driver
 from utils.SPA_utils import make_requests_session_from_driver
 
