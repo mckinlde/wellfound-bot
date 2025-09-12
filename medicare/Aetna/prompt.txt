@@ -93,3 +93,20 @@ Could not find platform independent libraries <prefix>
 [INFO] Visiting https://www.aetna.com/medicare/plan.H5521.475.html
     [WARN] No PDFs found
 [INFO] (4/564) H3239-020-0
+
+-------------------------------------------------------------------------------------------------------------------
+
+Now there's no captcha, but it just keeps asking me to solve it:
+
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\wellfound-bot\medicare\Aetna> & C:/Users/mckin/OneDrive/Desktop/wellfound-bot/.venv/Scripts/python.exe c:/Users/mckin/OneDrive/Desktop/wellfound-bot/medicare/Aetna/aetna_pdf_grabber.py
+Could not find platform independent libraries <prefix>
+[INFO] Total plans: 564
+[INFO] Processing progress range: 1..564 (inclusive)
+[INFO] (1/564) H5521-229-0
+[INFO] Visiting https://www.aetna.com/medicare/plan.H5521.229.html
+[ACTION] CAPTCHA detected. Solve it in the browser, then press Enter here to continue...
+[ACTION] CAPTCHA detected. Solve it in the browser, then press Enter here to continue...
+[ACTION] CAPTCHA detected. Solve it in the browser, then press Enter here to continue...
+[ACTION] CAPTCHA detected. Solve it in the browser, then press Enter here to continue...
+
+It never gets PDFs or loads the next page.

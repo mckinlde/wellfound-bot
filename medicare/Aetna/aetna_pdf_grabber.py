@@ -20,6 +20,8 @@ from urllib.parse import urljoin
 
 import pandas as pd
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 # if you want to keep relative imports
 # If you always run the script directly (python medicare/Aetna/aetna_pdf_grabber.py from the project root), you can instead do:
@@ -68,26 +70,26 @@ def scrape_plan_pdfs(driver, plan_id: str) -> dict:
     print(f"[INFO] Visiting {url}")
     driver.get(url)
 
-    # Loop until the real plan page loads (not CAPTCHA)
-    while True:
-        page_source = driver.page_source.lower()
-
-        if "captcha" in page_source or "validate" in page_source:
-            input("[ACTION] CAPTCHA detected. Solve it in the browser, then press Enter here to continue...")
-            sleep(2)
-            # re-check after you solve
-            continue
-
-        # Try grabbing links
-        elements = driver.find_elements(By.CSS_SELECTOR, "a.type__link__digitaldownload")
-        if elements:
-            break  # success, we’re on a real plan page
-
-        # No elements, might still be loading or blocked
-        print("    [WARN] No links yet, waiting...")
-        sleep(2)
-
     pdfs = {}
+
+    try:
+        # Wait up to 10s for at least one document link
+        elements = WebDriverWait(driver, 10).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.type__link__digitaldownload"))
+        )
+    except Exception:
+        # If nothing shows up, probably a CAPTCHA
+        input("[ACTION] No document links found (possibly CAPTCHA). Solve it in the browser, then press Enter...")
+        # After manual solve, try again
+        try:
+            elements = WebDriverWait(driver, 10).until(
+                EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.type__link__digitaldownload"))
+            )
+        except Exception:
+            print("    [ERROR] Still no links after waiting, skipping plan.")
+            return pdfs
+
+    # Collect PDFs
     for el in elements:
         try:
             label = (el.get_attribute("data-analytics-name") or "").strip()
@@ -98,7 +100,6 @@ def scrape_plan_pdfs(driver, plan_id: str) -> dict:
             continue
 
     return pdfs
-
 
 def download_pdf(session, url: str, out_path: str):
     try:
