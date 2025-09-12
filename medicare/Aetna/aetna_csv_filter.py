@@ -1,8 +1,9 @@
 import pandas as pd
 
 # Input and output file names
-input_file = "medicare/plan_links.csv"
-output_file = "medicare/Aetna/aetna_plan_links.csv"
+# Note: relative paths are used here
+input_file = "../plan_links.csv"
+output_file = "../Aetna/aetna_plan_links.csv"
 
 # Read the CSV
 df = pd.read_csv(input_file)
