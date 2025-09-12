@@ -47,7 +47,7 @@ DOC_LABELS = [
 ]
 
 
-def load_plan_ids(csv_path="aetna_plan_links.csv"):
+def load_plan_ids(csv_path="medicare/Aetna/aetna_plan_links.csv"):
     """Keep the CSV order, drop duplicates."""
     df = pd.read_csv(csv_path, dtype=str)
     plan_ids = df["plan_id"].drop_duplicates().tolist()
