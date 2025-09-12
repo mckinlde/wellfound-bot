@@ -64,11 +64,15 @@ def safe_name(s: str) -> str:
 
 
 def scrape_plan_pdfs(driver, plan_id: str) -> dict:
-    """Return {label: absolute_pdf_url} for the desired DOC_LABELS."""
     url = build_plan_url(plan_id)
+    print(f"[INFO] Visiting {url}")
     driver.get(url)
-    sleep(2)  # polite settle; page is static-ish
 
+    # If CAPTCHA page shows, pause until user confirms
+    if "validate" in driver.page_source.lower() or "captcha" in driver.page_source.lower():
+        input("[ACTION] CAPTCHA detected. Please solve it in the browser window, then press Enter here to continue...")
+
+    sleep(2)  # polite settle
     pdfs = {}
     for el in driver.find_elements(By.CSS_SELECTOR, "a.type__link__digitaldownload"):
         try:

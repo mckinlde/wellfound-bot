@@ -57,3 +57,13 @@ No, the script you just wrote is great; all I want you to change is to use these
 -------------------------------------------------------------------------------------------------------------------
 
 No, I think direct downloads will work.  I would like you to add some indication of progress though, like a print statement showing which plan_id we're on out of the total.  I'd also like to be able to pass a start and stop plan_id as a CLI to pick up where I left off after any crashes, and not redo work I've already done.
+
+-------------------------------------------------------------------------------------------------------------------
+
+Oops! We need to validate a few things before you can log in.
+
+We noticed something about your browser (Chrome, Edge, Safari, etc.) that makes us think you are a bot. Here are a few reasons this may happen:
+
+    You're using a browser plugin that's stopping JavaScript from running
+    You're using a VPN or privacy software often used by attackers
+    You're moving through the site at super-human speed
