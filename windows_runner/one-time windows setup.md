@@ -24,6 +24,9 @@ scoop install geckodriver
 cd <your-project-root>
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+```deprecated:
 pip install -r windows_runner/requirements-windows.txt
 ```
 
