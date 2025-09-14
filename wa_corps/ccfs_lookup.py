@@ -13,11 +13,7 @@ Workflow:
 - Writes structured results to output CSV
 - Skips UBIs already processed (Governors populated)
 
-Dependencies:
-- Selenium
-- BeautifulSoup4
-- utils.driver_session: start_driver, save_page_html
-- utils.SPA_utils: wait_scroll_interact, _safe_click_element
+Every list and detail page is saved so you can debug DOM transitions.
 """
 
 import csv
@@ -115,6 +111,7 @@ def process_ubi(ubi):
         list_result = save_page_html(driver, driver.current_url,
                                      timeout=20, extra_settle_seconds=2)
         list_capture_path = str(list_result["capture_path"])
+        print(f"[DEBUG] Saved list HTML to {list_capture_path}")
 
         # Iterate over result rows
         rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
@@ -124,25 +121,32 @@ def process_ubi(ubi):
                 link_el = rows[idx].find_element(By.CSS_SELECTOR, "td a")
                 business_name = link_el.text.strip()
                 print(f"[INFO] Clicking row {idx+1}: {business_name}")
-                _safe_click_element(driver, link_el)
 
+                # Force Angular click
+                driver.execute_script("arguments[0].click();", link_el)
                 if DEBUG_SLEEP: time.sleep(DEBUG_SLEEP)
-                WebDriverWait(driver, 20).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "div.businessDetail"))
-                )
 
-                # Save detail page HTML
-                detail_result = save_page_html(driver, driver.current_url,
-                                               timeout=20, extra_settle_seconds=2)
+                # Always save the page after clicking, even if wait fails
+                detail_result = None
+                try:
+                    WebDriverWait(driver, 30).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "div.businessDetail"))
+                    )
+                    if DEBUG_SLEEP: time.sleep(DEBUG_SLEEP)
+                finally:
+                    detail_result = save_page_html(driver, driver.current_url,
+                                                   timeout=30, extra_settle_seconds=2)
+                    print(f"[DEBUG] Saved detail HTML to {detail_result['capture_path']}")
 
-                details = parse_business_detail(str(detail_result["soup"]))
-                details.update({
-                    "UBI": ubi,
-                    "list_capture_path": list_capture_path,
-                    "detail_capture_path": str(detail_result["capture_path"]),
-                    "debug_path": str(detail_result["debug_path"]),
-                })
-                results.append(details)
+                if detail_result and detail_result["soup"]:
+                    details = parse_business_detail(str(detail_result["soup"]))
+                    details.update({
+                        "UBI": ubi,
+                        "list_capture_path": list_capture_path,
+                        "detail_capture_path": str(detail_result["capture_path"]),
+                        "debug_path": str(detail_result["debug_path"]),
+                    })
+                    results.append(details)
 
                 # Click Back to return
                 back_btn = driver.find_element(By.ID, "btnReturnToSearch")
