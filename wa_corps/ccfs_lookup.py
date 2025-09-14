@@ -10,9 +10,10 @@ ccfs_lookup.py — scrape WA CCFS by UBI.
     - structured JSON
 into wa_corps/html_captures and wa_corps/business_json.
 
-No CSV flattening. Shows progress.
+Adds start_n / stop_n CLI args for splitting runs in parallel.
 """
 
+import argparse
 import csv
 import json
 import time
@@ -153,6 +154,11 @@ def process_ubi(driver, ubi: str, index: int, total: int):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start_n", type=int, default=1, help="Start index (1-based)")
+    parser.add_argument("--stop_n", type=int, default=None, help="Stop index (inclusive)")
+    args = parser.parse_args()
+
     # Load UBIs
     with INPUT_CSV.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -163,8 +169,18 @@ def main():
         print("[ERROR] No UBIs found in input CSV")
         return
 
+    start_n = max(1, args.start_n)
+    stop_n = args.stop_n if args.stop_n is not None else total
+    if start_n > total:
+        print(f"[ERROR] start_n {start_n} > total {total}")
+        return
+    stop_n = min(stop_n, total)
+
+    ubis_to_process = ubis[start_n - 1: stop_n]
+    print(f"[INFO] Loaded {total} UBIs, processing {len(ubis_to_process)} (rows {start_n}..{stop_n})")
+
     with start_driver() as driver:
-        for i, ubi in enumerate(ubis, start=1):
+        for i, ubi in enumerate(ubis_to_process, start=start_n):
             process_ubi(driver, ubi, i, total)
 
 
