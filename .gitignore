@@ -2,7 +2,7 @@
 *.log
 
 # HTML capture output
-html_captures/
+*.html
 
 # .pyc
 *.pyc
