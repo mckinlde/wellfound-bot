@@ -21,7 +21,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-from utils.driver_session import start_driver
+from utils.driver_session import start_driver, save_page_html
 from utils.SPA_utils import wait_scroll_interact
 
 # -------------------------------------------------------------------
