@@ -39,7 +39,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-from driver_session import start_driver
+from utils.driver_session import start_driver
 
 # Constants
 BASE_URL = "https://ccfs.sos.wa.gov/#/BusinessSearch"
