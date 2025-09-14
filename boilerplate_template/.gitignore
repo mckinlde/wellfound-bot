@@ -1,0 +1,17 @@
+# Logs
+*.log
+
+# HTML capture output
+*.html
+
+# .pyc
+*.pyc
+
+# Flake.lock
+*.lock
+
+# csv
+*.csv
+
+# pdf
+*.pdf
