@@ -82,6 +82,11 @@ def cache_business_links(driver, ubi):
     if DEBUG_SLEEP:
         time.sleep(DEBUG_SLEEP)
 
+    # 💾 Save the search result list HTML for debugging
+    result = save_page_html(driver, driver.current_url,
+                            timeout=20, extra_settle_seconds=2)
+    print(f"[DEBUG] Saved search result HTML to {result['capture_path']}")
+
     rows = driver.find_elements(By.CSS_SELECTOR, "table tbody tr")
     if not rows:
         print(f"[WARN] No results found for UBI {ubi}")
