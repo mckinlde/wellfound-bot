@@ -4,6 +4,9 @@
 # HTML capture output
 *.html
 
+# JSON capture output
+*.json
+
 # .pyc
 *.pyc
 

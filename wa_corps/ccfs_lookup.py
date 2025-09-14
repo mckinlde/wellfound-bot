@@ -2,156 +2,297 @@
 """
 ccfs_lookup.py — scrape WA CCFS by UBI.
 
-- Reads UBIs from wa_corps/constants/Business Search Result.csv
-- Navigates CCFS SPA
-- Saves:
-    - list.html
-    - detail.html
-    - structured JSON
-into wa_corps/html_captures and wa_corps/business_json.
+Input  : wa_corps/constants/Business Search Result.csv (column "UBI#")
+Output : for each UBI
+  - wa_corps/html_captures/{UBI}/list.html
+  - wa_corps/html_captures/{UBI}/detail.html
+  - wa_corps/business_json/{UBI}.json
 
-Adds start_n / stop_n CLI args for splitting runs in parallel.
+CLI slicing for parallel runs:
+  --start_n N (1-based, inclusive)
+  --stop_n  M (inclusive)
 """
 
 import argparse
 import csv
 import json
 import time
+import sys
 from pathlib import Path
+
 from bs4 import BeautifulSoup
+from selenium.common.exceptions import (
+    TimeoutException, NoSuchElementException, StaleElementReferenceException
+)
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
-from driver_session import start_driver
+# --- repo path setup (import start_driver) ---
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from utils.driver_session import start_driver  # noqa
 
-# Paths
-INPUT_CSV = Path("wa_corps/constants/Business Search Result.csv")
-HTML_CAPTURE_DIR = Path("wa_corps/html_captures")
-JSON_OUTPUT_DIR = Path("wa_corps/business_json")
+# --- paths ---
+INPUT_CSV        = ROOT / "wa_corps" / "constants" / "Business Search Result.csv"
+HTML_CAPTURE_DIR = ROOT / "wa_corps" / "html_captures"
+JSON_OUTPUT_DIR  = ROOT / "wa_corps" / "business_json"
 HTML_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
 JSON_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Config
-BASE_URL = "https://ccfs.sos.wa.gov/#/BusinessSearch"
-WAIT_TIME = 20
+# --- config ---
+BASE_URL  = "https://ccfs.sos.wa.gov/"
+WAIT_TIME = 25  # generous; Angular SPA needs time
 
 
-def save_html(path: Path, content: str):
+# ----------------------- helpers -----------------------
+
+def save_html(path: Path, content: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return str(path)
 
 
 def parse_detail_html(html: str, ubi: str) -> dict:
-    """Parse detail HTML into structured JSON (flexible/expandable)."""
+    """
+    Flexible parser that records sections and any tables/fields we see.
+    Expands naturally if CCFS adds data later.
+    """
     soup = BeautifulSoup(html, "html.parser")
-    data = {"UBI": ubi, "sections": {}}
+    data = {"UBI": ubi, "sections": {}, "meta": {}}
 
+    # Try to grab page header title if present
+    hdr = soup.select_one("header.page-header h2")
+    if hdr:
+        data["meta"]["page_header"] = hdr.get_text(strip=True)
+
+    # Each big block is introduced by a .div_header
     for header in soup.select("div.div_header"):
         section_name = header.get_text(strip=True)
         section = {}
 
-        # Look for tables
-        table = header.find_next("table")
-        if table:
+        # Prefer a table immediately following the header (Governors, etc.)
+        table = header.find_next(lambda t: t.name == "table")
+        if table and header.find_all_previous(limit=3, name=lambda n: False) is not None:
             rows = []
+            thead = table.select_one("thead")
+            if thead:
+                headers = [th.get_text(strip=True) for th in thead.find_all("th")]
+                if headers:
+                    section["columns"] = headers
             for tr in table.select("tbody tr"):
-                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                if cells:
-                    rows.append(cells)
+                row = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if any(cell for cell in row):
+                    rows.append(row)
             if rows:
                 section["rows"] = rows
 
-        # Otherwise look for fields
-        else:
+        # If no table context, collect label/value fields in the block
+        if not section:
             fields = {}
+            # Walk subsequent .row siblings until we hit another header or a footer/tools region
             for row in header.find_all_next("div", class_="row"):
+                # Stop if we wandered into a new major header
+                h2 = row.find_previous_sibling("div", class_="div_header")
+                if h2 and h2 is not header:
+                    break
                 cols = row.find_all("div", class_="col-md-3")
-                if len(cols) == 2:
-                    label = cols[0].get_text(strip=True).rstrip(":")
-                    value = cols[1].get_text(strip=True)
-                    if label:
-                        fields[label] = value
-                else:
+                # Many sections use pairs of 2x col-md-3 blocks per row
+                if len(cols) >= 2:
+                    # Handle pairs: (label, value), (label, value)
+                    for i in range(0, len(cols) - 1, 2):
+                        label = cols[i].get_text(strip=True).rstrip(":")
+                        value = cols[i + 1].get_text(strip=True)
+                        if label:
+                            fields[label] = value
+                # Stop when we encounter buttons/footer
+                if row.find(["input", "button"]):
                     break
             if fields:
                 section["fields"] = fields
 
-        data["sections"][section_name] = section
+        if section:
+            data["sections"][section_name] = section
 
     return data
 
 
+def wait_clickable(driver, locator, timeout=WAIT_TIME):
+    return WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
+
+
+def wait_present(driver, locator, timeout=WAIT_TIME):
+    return WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
+
+
+def js_click(driver, element):
+    driver.execute_script("arguments[0].click();", element)
+
+
+def ensure_home_search_box(driver):
+    """
+    Make sure we're on the HOME page and can see the global search input
+    with placeholder containing 'UBI'. If we're on a results page, click Back.
+    """
+    # Quick path: try to find the input where we are
+    for _ in range(2):
+        try:
+            box = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, "//input[contains(@placeholder,'UBI')]"))
+            )
+            return box
+        except TimeoutException:
+            pass
+        # If we didn't find the box, try a 'Back' button (results page shows Back)
+        try:
+            back_btn = driver.find_element(By.XPATH, "//input[@value='Back' or @id='btnReturnToSearch']")
+            try:
+                js_click(driver, back_btn)
+            except Exception:
+                back_btn.click()
+            time.sleep(1.5)
+        except NoSuchElementException:
+            break
+
+    # Force-load HOME and wait for the box
+    driver.get(BASE_URL)
+    return wait_clickable(driver, (By.XPATH, "//input[contains(@placeholder,'UBI')]"))
+
+
+def submit_search_from_home(driver, ubi: str):
+    """
+    On HOME page: type UBI into the big search box and submit.
+    Prefer clicking the Search button; fall back to ENTER.
+    """
+    search_input = ensure_home_search_box(driver)
+    search_input.clear()
+    search_input.send_keys(ubi)
+
+    # Try to click a Search button near it (or any visible Search button)
+    buttons = driver.find_elements(By.XPATH, "//button[normalize-space()='Search'] | //input[@type='button' and @value='Search']")
+    clicked = False
+    for b in buttons:
+        try:
+            if b.is_displayed() and b.is_enabled():
+                try:
+                    js_click(driver, b)
+                except Exception:
+                    b.click()
+                clicked = True
+                break
+        except StaleElementReferenceException:
+            continue
+
+    if not clicked:
+        search_input.send_keys(Keys.ENTER)
+
+    # Wait for at least the results table to appear (even if empty first)
+    wait_present(driver, (By.XPATH, "//table[contains(@class,'table')]"))
+    # Give Angular a moment to render rows
+    time.sleep(1.5)
+
+
+def ensure_results_have_rows_or_retry(driver, ubi: str):
+    """
+    If results show 0 rows, try to go Back and re-run search once.
+    Return True if we have >= 1 row after possible retry, else False.
+    """
+    def row_count():
+        return len(driver.find_elements(By.XPATH, "//table[contains(@class,'table')]//tbody/tr"))
+
+    if row_count() > 0:
+        return True
+
+    # Try one retry path: click Back → home → submit again
+    try:
+        back_btn = driver.find_element(By.XPATH, "//input[@value='Back' or @id='btnReturnToSearch']")
+        try:
+            js_click(driver, back_btn)
+        except Exception:
+            back_btn.click()
+        time.sleep(1.0)
+    except NoSuchElementException:
+        # If no Back, force home
+        driver.get(BASE_URL)
+
+    # Re-submit
+    submit_search_from_home(driver, ubi)
+    time.sleep(1.0)
+    return row_count() > 0
+
+
+def click_first_result(driver) -> str:
+    """
+    Clicks the first result link in the results table.
+    Returns the business name text (best-effort) for logging.
+    """
+    first_link = wait_clickable(
+        driver, (By.XPATH, "//table[contains(@class,'table')]//tbody/tr[1]//a")
+    )
+    name = first_link.text.strip()
+    try:
+        js_click(driver, first_link)
+    except Exception:
+        first_link.click()
+    return name
+
+
+# ----------------------- main per-UBI flow -----------------------
+
 def process_ubi(driver, ubi: str, index: int, total: int):
     ubi_clean = ubi.replace(" ", "")
     ubi_dir = HTML_CAPTURE_DIR / ubi_clean
-
     print(f"[INFO] Processing UBI {index}/{total}: {ubi}")
 
-    driver.get(BASE_URL)
-
     try:
-        # Wait for search input
-        search_input = WebDriverWait(driver, WAIT_TIME).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "input[placeholder='UBI, Business Name, or Registered Agent']")
-            )
-        )
-        search_input.clear()
-        search_input.send_keys(ubi)
+        # Always begin from Home and submit the search there (this is the reliable route)
+        submit_search_from_home(driver, ubi)
 
-        # Click Search button
-        search_btn = driver.find_element(By.XPATH, "//button[contains(., 'Search')]")
-        search_btn.click()
-
-        # Wait for results table
-        WebDriverWait(driver, WAIT_TIME).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "table.table"))
-        )
-        time.sleep(2)  # let Angular render fully
-
-        # Save list.html
-        list_html = driver.page_source
-        save_html(ubi_dir / "list.html", list_html)
-
-        # Click first result link
-        try:
-            first_link = driver.find_element(By.CSS_SELECTOR, "table.table tbody tr td a.btn-link")
-            business_name = first_link.text.strip()
-            print(f"[INFO] Clicking: {business_name}")
-            first_link.click()
-        except NoSuchElementException:
-            print(f"[WARN] No search results for UBI {ubi}")
+        # If we landed on results but with zero rows, recover via Back → retry once
+        if not ensure_results_have_rows_or_retry(driver, ubi):
+            # Save the empty list page for forensics, then give up on this UBI
+            save_html(ubi_dir / "list.html", driver.page_source)
+            print(f"[WARN] No results for UBI {ubi}")
             return
 
-        # Wait for detail view
-        WebDriverWait(driver, WAIT_TIME).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div#divBusinessInformation"))
-        )
-        time.sleep(2)
+        # Save list.html (with rows)
+        save_html(ubi_dir / "list.html", driver.page_source)
+
+        # Click the first (and only one we need)
+        try:
+            business_name = click_first_result(driver)
+            if business_name:
+                print(f"[INFO] Clicking: {business_name}")
+        except TimeoutException:
+            print(f"[ERROR] Could not click first result for UBI {ubi}")
+            return
+
+        # Wait for details panel
+        wait_present(driver, (By.ID, "divBusinessInformation"))
+        time.sleep(1.5)  # let Angular finish
 
         # Save detail.html
-        detail_html = driver.page_source
-        save_html(ubi_dir / "detail.html", detail_html)
+        save_html(ubi_dir / "detail.html", driver.page_source)
 
-        # Parse → JSON
-        json_data = parse_detail_html(detail_html, ubi)
+        # Parse to JSON
+        json_data = parse_detail_html(driver.page_source, ubi)
         json_data["capture_paths"] = {
             "list_html": str(ubi_dir / "list.html"),
             "detail_html": str(ubi_dir / "detail.html"),
         }
-
-        # Save JSON
-        json_out = JSON_OUTPUT_DIR / f"{ubi_clean}.json"
-        json_out.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
-
-        print(f"[INFO] Saved JSON → {json_out}")
+        out_path = JSON_OUTPUT_DIR / f"{ubi_clean}.json"
+        out_path.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
+        print(f"[INFO] Saved JSON → {out_path}")
 
     except TimeoutException:
         print(f"[ERROR] Timeout for UBI {ubi}")
+    except Exception as e:
+        print(f"[ERROR] Unexpected error for UBI {ubi}: {e}")
 
+
+# ----------------------- CLI & runner -----------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -159,28 +300,35 @@ def main():
     parser.add_argument("--stop_n", type=int, default=None, help="Stop index (inclusive)")
     args = parser.parse_args()
 
-    # Load UBIs
+    if not INPUT_CSV.exists():
+        print(f"[ERROR] Input CSV not found: {INPUT_CSV}")
+        sys.exit(1)
+
+    # Read all UBIs
     with INPUT_CSV.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        ubis = [row["UBI"].strip() for row in reader if row.get("UBI")]
+        ubis = [row["UBI#"].strip() for row in reader if row.get("UBI#")]
 
     total = len(ubis)
-    if not total:
+    if total == 0:
         print("[ERROR] No UBIs found in input CSV")
-        return
+        sys.exit(1)
 
     start_n = max(1, args.start_n)
     stop_n = args.stop_n if args.stop_n is not None else total
     if start_n > total:
         print(f"[ERROR] start_n {start_n} > total {total}")
-        return
+        sys.exit(1)
     stop_n = min(stop_n, total)
 
-    ubis_to_process = ubis[start_n - 1: stop_n]
-    print(f"[INFO] Loaded {total} UBIs, processing {len(ubis_to_process)} (rows {start_n}..{stop_n})")
+    slice_ubis = ubis[start_n - 1: stop_n]
+    print(f"[INFO] Loaded {total} UBIs, processing {len(slice_ubis)} (rows {start_n}..{stop_n})")
 
+    # Single stable session
     with start_driver() as driver:
-        for i, ubi in enumerate(ubis_to_process, start=start_n):
+        # Ensure we load home once up-front (also prompts any CF/js to settle)
+        driver.get(BASE_URL)
+        for i, ubi in enumerate(slice_ubis, start=start_n):
             process_ubi(driver, ubi, i, total)
 
 
