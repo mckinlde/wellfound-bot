@@ -1,0 +1,110 @@
+Perfect. Here’s how I’ll restructure the parser:
+
+### Parsing Strategy
+
+1. **Section detection**: Still use each `.div_header` as the start of a new section.
+2. **Fields mode**: If the following siblings are `.row` containers with `label → value` pairs, parse them into a `"fields"` dict.
+3. **Table mode**: If a `<table>` is found, parse headers and rows into `"columns"` + `"rows"`.
+4. **Mixed mode**: Allow a section to contain both `"fields"` and `"rows"` if present.
+5. **Empty values**: Capture blanks as `""`, not drop them.
+6. **Meta**: Keep `UBI` and `page_header`.
+
+---
+
+### Refactored `parse_detail_html`
+
+```python
+def parse_detail_html(html: str, ubi: str) -> dict:
+    """Parse detail HTML into structured JSON with both fields and tables."""
+    soup = BeautifulSoup(html, "html.parser")
+    data = {"UBI": ubi, "sections": {}}
+
+    page_header = soup.select_one("header.page-header h2")
+    if page_header:
+        data["meta"] = {"page_header": page_header.get_text(strip=True)}
+
+    for header in soup.select("div.div_header"):
+        section_name = header.get_text(strip=True)
+        section = {}
+
+        # ---------- Try tables ----------
+        table = header.find_next("table")
+        if table and header.find_next(string=True) in table.strings:
+            # Parse table
+            cols = [th.get_text(strip=True) for th in table.select("thead th")]
+            rows = []
+            for tr in table.select("tbody tr"):
+                row = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if row:
+                    rows.append(row)
+            if cols or rows:
+                section["columns"] = cols
+                section["rows"] = rows
+
+        # ---------- Try fields ----------
+        fields = {}
+        for row in header.find_all_next("div", class_="row"):
+            cols = row.find_all("div", class_=["col-md-3", "col-md-5", "col-md-7", "col-md-8"])
+            if len(cols) >= 2:
+                label = cols[0].get_text(strip=True).rstrip(":")
+                value = cols[1].get_text(strip=True)
+                if label:
+                    fields[label] = value
+            else:
+                # Stop once we hit unrelated layout
+                if fields:
+                    break
+        if fields:
+            section["fields"] = fields
+
+        if section:
+            data["sections"][section_name] = section
+
+    return data
+```
+
+---
+
+### Expected JSON (UBI 604602352)
+
+```json
+{
+  "UBI": "604 602 352",
+  "meta": { "page_header": "Business Information" },
+  "sections": {
+    "Business Information": {
+      "fields": {
+        "Business Name": "TACOMA PSYCHOLOGICAL SERVICES, PLLC",
+        "UBI Number": "604 602 352",
+        "Business Type": "WA PROFESSIONAL LIMITED LIABILITY COMPANY",
+        "Business Status": "ACTIVE",
+        "Principal Office Street Address": "708 BROADWAY STE 170, TACOMA, WA, 98402-3778, UNITED STATES",
+        "Principal Office Mailing Address": "708 BROADWAY STE 170, TACOMA, WA, 98402-3778, UNITED STATES",
+        "Expiration Date": "04/30/2026",
+        "Jurisdiction": "UNITED STATES, WASHINGTON",
+        "Formation/ Registration Date": "04/14/2020",
+        "Period of Duration": "PERPETUAL",
+        "Inactive Date": "",
+        "Nature of Business": "HEALTH CARE, SOCIAL ASSISTANCE & SERVICE ORGANIZATION"
+      }
+    },
+    "Registered Agent Information": {
+      "fields": {
+        "Registered Agent Name": "SEAN MORRISON",
+        "Street Address": "708 BROADWAY STE 170, TACOMA, WA, 98402-3778, UNITED STATES",
+        "Mailing Address": "708 BROADWAY STE 170, TACOMA, WA, 98402-3778, UNITED STATES"
+      }
+    },
+    "Governors": {
+      "columns": ["Title", "Governors Type", "Entity Name", "First Name", "Last Name"],
+      "rows": [["GOVERNOR", "INDIVIDUAL", "", "SEAN", "MORRISON"]]
+    }
+  }
+}
+```
+
+---
+
+👉 This way you’ll **retain addresses, dates, jurisdiction, and agents** while still keeping tables like Governors intact.
+
+Do you want me to also retrofit this parser into your `ccfs_lookup.py` so that JSONs are automatically updated, or do you prefer a **standalone parser script** that can be rerun on existing `detail.html` captures?

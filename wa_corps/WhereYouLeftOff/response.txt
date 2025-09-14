@@ -1,0 +1,49 @@
+Yes — your suspicion is correct.
+
+Looking at the raw `detail.html` for **UBI 604602352**, there are several address fields and dates that **did not make it into your JSON**:
+
+### Fields visible in the HTML but missing in JSON
+
+* **Principal Office Street Address**
+  `"708 BROADWAY STE 170, TACOMA, WA, 98402-3778, UNITED STATES"`
+* **Principal Office Mailing Address**
+  `"708 BROADWAY STE 170, TACOMA, WA, 98402-3778, UNITED STATES"`
+* **Expiration Date**
+  `04/30/2026`
+* **Jurisdiction**
+  `UNITED STATES, WASHINGTON`
+* **Formation/Registration Date**
+  `04/14/2020`
+* **Period of Duration**
+  `PERPETUAL`
+* **Inactive Date**
+  (empty here, but should still be parsed if present)
+* **Nature of Business**
+  `HEALTH CARE, SOCIAL ASSISTANCE & SERVICE ORGANIZATION`
+* **Registered Agent Info** (currently mis-parsed as a "Governors" table):
+
+  * Registered Agent Name: `SEAN MORRISON`
+  * Street Address: `708 BROADWAY STE 170, TACOMA, WA, 98402-3778, UNITED STATES`
+  * Mailing Address: `708 BROADWAY STE 170, TACOMA, WA, 98402-3778, UNITED STATES`
+
+### Why JSON missed them
+
+Your parser currently:
+
+* Assumes every `.div_header` section has either a `<table>` or `.row` pairs of `(label,value)` inside.
+* But in the "Business Information" block, fields are laid out in repeated `.row` structures without a following `<table>`.
+* As a result, those fields aren’t picked up — instead the parser mistakenly latched onto the **Governors** `<table>` and copied its schema into multiple sections ("Business Information", "Registered Agent Information", "Governors").
+
+### What you’ll want to fix
+
+1. **Treat each `.row` under “Business Information” as fields** (not a table).
+2. **Stop carrying over the Governors table schema into unrelated sections.**
+3. **Keep table parsing for true tabular sections** (Governors, Filing History, etc.).
+4. **Capture empty values explicitly** (so later diffs show whether a field was blank vs. missing).
+
+---
+
+✅ **Answer:**
+Yes, important fields like addresses, dates, jurisdiction, and nature of business are missing from the JSON. This happened because the parser misclassified the “Business Information” and “Registered Agent Information” blocks as tables, when they are actually sets of field/value rows.
+
+Would you like me to refactor the `parse_detail_html` so it **outputs both structured fields and tables**, ensuring addresses and dates are included in JSON, while still keeping Governors and similar data tabular?
