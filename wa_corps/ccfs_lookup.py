@@ -56,62 +56,47 @@ def save_html(path: Path, content: str) -> str:
 
 
 def parse_detail_html(html: str, ubi: str) -> dict:
-    """
-    Flexible parser that records sections and any tables/fields we see.
-    Expands naturally if CCFS adds data later.
-    """
+    """Parse detail HTML into structured JSON with both fields and tables."""
     soup = BeautifulSoup(html, "html.parser")
-    data = {"UBI": ubi, "sections": {}, "meta": {}}
+    data = {"UBI": ubi, "sections": {}}
 
-    # Try to grab page header title if present
-    hdr = soup.select_one("header.page-header h2")
-    if hdr:
-        data["meta"]["page_header"] = hdr.get_text(strip=True)
+    page_header = soup.select_one("header.page-header h2")
+    if page_header:
+        data["meta"] = {"page_header": page_header.get_text(strip=True)}
 
-    # Each big block is introduced by a .div_header
     for header in soup.select("div.div_header"):
         section_name = header.get_text(strip=True)
         section = {}
 
-        # Prefer a table immediately following the header (Governors, etc.)
-        table = header.find_next(lambda t: t.name == "table")
-        if table and header.find_all_previous(limit=3, name=lambda n: False) is not None:
+        # ---------- Try tables ----------
+        table = header.find_next("table")
+        if table and header.find_next(string=True) in table.strings:
+            # Parse table
+            cols = [th.get_text(strip=True) for th in table.select("thead th")]
             rows = []
-            thead = table.select_one("thead")
-            if thead:
-                headers = [th.get_text(strip=True) for th in thead.find_all("th")]
-                if headers:
-                    section["columns"] = headers
             for tr in table.select("tbody tr"):
                 row = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
-                if any(cell for cell in row):
+                if row:
                     rows.append(row)
-            if rows:
+            if cols or rows:
+                section["columns"] = cols
                 section["rows"] = rows
 
-        # If no table context, collect label/value fields in the block
-        if not section:
-            fields = {}
-            # Walk subsequent .row siblings until we hit another header or a footer/tools region
-            for row in header.find_all_next("div", class_="row"):
-                # Stop if we wandered into a new major header
-                h2 = row.find_previous_sibling("div", class_="div_header")
-                if h2 and h2 is not header:
+        # ---------- Try fields ----------
+        fields = {}
+        for row in header.find_all_next("div", class_="row"):
+            cols = row.find_all("div", class_=["col-md-3", "col-md-5", "col-md-7", "col-md-8"])
+            if len(cols) >= 2:
+                label = cols[0].get_text(strip=True).rstrip(":")
+                value = cols[1].get_text(strip=True)
+                if label:
+                    fields[label] = value
+            else:
+                # Stop once we hit unrelated layout
+                if fields:
                     break
-                cols = row.find_all("div", class_="col-md-3")
-                # Many sections use pairs of 2x col-md-3 blocks per row
-                if len(cols) >= 2:
-                    # Handle pairs: (label, value), (label, value)
-                    for i in range(0, len(cols) - 1, 2):
-                        label = cols[i].get_text(strip=True).rstrip(":")
-                        value = cols[i + 1].get_text(strip=True)
-                        if label:
-                            fields[label] = value
-                # Stop when we encounter buttons/footer
-                if row.find(["input", "button"]):
-                    break
-            if fields:
-                section["fields"] = fields
+        if fields:
+            section["fields"] = fields
 
         if section:
             data["sections"][section_name] = section
