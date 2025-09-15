@@ -20,6 +20,7 @@ import shutil
 import tempfile
 import logging
 import time
+import random
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -42,6 +43,14 @@ _FIREFOX_BIN = os.getenv("FIREFOX_BIN") or None
 _GECKO_PATH = os.getenv("GECKODRIVER_PATH") or None
 _HEADLESS = (os.getenv("FIREFOX_HEADLESS") == "1")
 
+
+SEED_URLS = [
+    "https://www.wikipedia.org/",
+    "https://www.bbc.com/news",
+    "https://www.nytimes.com/",
+    "https://www.reddit.com/",
+    "https://weather.com/",
+]
 
 # ---------- Filesystem helpers ----------
 def _ensure_dirs() -> None:
@@ -131,6 +140,27 @@ def start_driver(
         except Exception as e:
             logging.warning("Error removing temp profile dir: %s", e)
 
+
+# ---------- Driver warmup + context manager ----------
+@contextmanager
+def spinup_driver(headless=False, page_load_timeout=30):
+    cm = start_driver(headless=headless, page_load_timeout=page_load_timeout)
+    driver = cm.__enter__()
+    try:
+        # warmup visits
+        for url in random.sample(SEED_URLS, k=3):
+            try:
+                driver.get(url)
+                time.sleep(random.uniform(2, 4))
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+                time.sleep(random.uniform(1, 2))
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(random.uniform(1, 2))
+            except Exception as e:
+                logging.warning(f"⚠️ Failed visiting {url}: {e}")
+        yield driver
+    finally:
+        cm.__exit__(None, None, None)
 
 # ---------- Page → Soup ----------
 def get_soup_from_url(

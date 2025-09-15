@@ -24,3 +24,5 @@ Adds start_n / stop_n CLI args for splitting runs in parallel.
 - README.md: explain what you're trying to scrape, the high-level plan
 - Snippets.md: useful devops snippets like activate venv / install requirements
 - gitignore: you want to ignore large files, logs, basically stuff that exists after a run
+
+Note: It's generally better to solve captchas with user input and script resuming afterwards.  Horizontal scaling probably involves multiplexing to many machines for captcha solving.

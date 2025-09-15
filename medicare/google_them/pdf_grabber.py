@@ -1,26 +1,199 @@
-# A script to google medicare advantage [plan id, plan name]s and grab the pdf links
-# for the plan documents (summary of benefits, proof of coverage, drug formulary)
-# from the search results.
+import os
+import csv
+import time
+import random
+import argparse
+import logging
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, parse_qs, quote_plus
+
+from utils.driver_session import start_driver
+
+LOG_FILE = "google_pdf_grabber.log"
+logging.basicConfig(
+    filename=LOG_FILE,
+    filemode="a",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("google_pdf_grabber")
+
+DOC_TYPES = {
+    "Summary_of_Benefits": "summary of benefits",
+    "Evidence_of_Coverage": "evidence of coverage",
+    "Drug_Formulary": "formulary drug list",
+}
 
 
-# Inputs:
-# - A CSV file with columns "plan_id", "plan_name", "company"
-#   (e.g. medicare/plan_links.csv)
-# Outputs:
-# - A CSV file with columns "plan_id", "plan_name", "company", "source_url", "EoC_pdf_link", "EoC_pdf_filepath", "SOB_pdf_link", "SOB_pdf_filepath", "formulary_pdf_link", "formulary_pdf_filepath"
-#   (e.g. medicare/google_them/plan_docs.csv)
-# - PDF files downloaded to medicare/google_them/<plan_id>_<document_type>.pdf
-#   (e.g. medicare/google_them/H0104-012-0_EoC.pdf)
-#   (e.g. medicare/google_them/H0104-012-0_SOB.pdf)
-#   (e.g. medicare/google_them/H0104-012-0_formulary.pdf)
-# Special notes:
-# - Uses Google search, so be mindful of rate limits and CAPTCHAs.
-# - Save html of search results for debugging to medicare/google_them/html/
-# - This is a best-effort scraper; not all plans will have all documents available.
-# - If no documents are found for a plan, save "error: not found" in the respective fields.
-# - Show progress with format X/Y where X is current index and Y is len(plan_ids).
-# - Use a ../../utils/driver_session.py start_driver() to create a Firefox driver with a custom profile.
-# - Use a requests.Session() for downloading PDFs to reuse connections and share cookies from driver.
-# - Use a polite delay (e.g. 1-2 seconds) between requests to avoid being blocked.
-# - Log errors and exceptions to the console for visibility.
-# - Use BeautifulSoup to parse HTML and extract links.
+def polite_sleep():
+    time.sleep(random.uniform(1.0, 2.0))
+
+
+def extract_google_results_links(soup):
+    """Extract real URLs from Google results."""
+    links = []
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if href.startswith("/url?"):
+            qs = parse_qs(urlparse(href).query)
+            real = qs.get("q", [""])[0]
+            if real and ".pdf" in real.lower():
+                links.append(real)
+    return links
+
+
+def parse_and_categorize(driver, plan_id, query, html_dir, label=None, page=1):
+    """Run a Google search, save HTML, return categorized pdf links."""
+    url = f"https://www.google.com/search?q={quote_plus(query)}&hl=en&num=10&start={(page-1)*10}"
+    driver.get(url)
+    polite_sleep()
+
+    # Save HTML
+    html_path = os.path.join(html_dir, f"{plan_id}_{label or 'broad'}_page{page}.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(driver.page_source)
+
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+
+    # Captcha detection
+    if soup.select_one("#recaptcha-anchor") or "recaptcha" in driver.page_source.lower():
+        input("[ACTION] CAPTCHA detected. Solve it in the browser, then press Enter here to continue...")
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+
+    found = {}
+    for link in extract_google_results_links(soup):
+        lower = link.lower()
+        if ("summary" in lower or "sob" in lower) and "Summary_of_Benefits" not in found:
+            found["Summary_of_Benefits"] = link
+        elif ("coverage" in lower or "eoc" in lower) and "Evidence_of_Coverage" not in found:
+            found["Evidence_of_Coverage"] = link
+        elif ("formulary" in lower or "drug" in lower) and "Drug_Formulary" not in found:
+            found["Drug_Formulary"] = link
+    return found
+
+
+def google_search_for_pdfs(driver, plan_id, plan_name, html_dir, max_pages=3):
+    """Try a broad search first, then fall back to targeted queries for missing docs."""
+    results = {}
+
+    # Broad search
+    query = f"{plan_id} {plan_name} filetype:pdf"
+    for page in range(1, max_pages + 1):
+        found = parse_and_categorize(driver, plan_id, query, html_dir, label="broad", page=page)
+        results.update({k: v for k, v in found.items() if k not in results})
+        if all(doc in results for doc in DOC_TYPES.keys()):
+            break
+
+    # Fallback for missing doc types
+    missing = [doc for doc in DOC_TYPES.keys() if doc not in results]
+    for doc_label in missing:
+        query = f"{plan_id} {plan_name} {DOC_TYPES[doc_label]} filetype:pdf"
+        for page in range(1, max_pages + 1):
+            found = parse_and_categorize(driver, plan_id, query, html_dir, label=doc_label, page=page)
+            if doc_label in found:
+                results[doc_label] = found[doc_label]
+                break
+
+    return results
+
+
+def download_pdf(session, url, dest_path):
+    """Download PDF if not already saved."""
+    if not url:
+        return False
+    if os.path.exists(dest_path):
+        logger.info(f"⏩ Skipping existing {dest_path}")
+        return True
+    try:
+        r = session.get(url, stream=True, timeout=30)
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+        logger.info(f"✅ Saved {dest_path}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed {url}: {e}")
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--outdir", required=True)
+    ap.add_argument("--start", type=int, default=1)
+    args = ap.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+    html_dir = os.path.join(args.outdir, "html")
+    os.makedirs(html_dir, exist_ok=True)
+
+    with open(args.input, newline="", encoding="utf-8") as f:
+        reader = list(csv.DictReader(f))
+    total = len(reader)
+
+    out_exists = os.path.exists(args.output)
+    out_fh = open(args.output, "a", newline="", encoding="utf-8")
+    out_writer = csv.DictWriter(
+        out_fh,
+        fieldnames=[
+            "plan_id","plan_name","company",
+            "SOB_pdf_link","SOB_pdf_filepath",
+            "EoC_pdf_link","EoC_pdf_filepath",
+            "formulary_pdf_link","formulary_pdf_filepath",
+        ],
+    )
+    if not out_exists:
+        out_writer.writeheader()
+
+    with start_driver(headless=False) as driver:
+        session = requests.Session()
+
+        for idx, plan in enumerate(reader, start=1):
+            if idx < args.start:
+                continue
+
+            plan_id = plan["plan_id"].strip()
+            plan_name = plan["plan_name"].strip()
+            company = plan["company"].strip()
+
+            row = {
+                "plan_id": plan_id,
+                "plan_name": plan_name,
+                "company": company,
+                "SOB_pdf_link": "",
+                "SOB_pdf_filepath": "",
+                "EoC_pdf_link": "",
+                "EoC_pdf_filepath": "",
+                "formulary_pdf_link": "",
+                "formulary_pdf_filepath": "",
+            }
+
+            print(f"[{idx}/{total}] Searching PDFs for {plan_id} {plan_name}")
+
+            pdfs = google_search_for_pdfs(driver, plan_id, plan_name, html_dir)
+
+            for doc_label, pdf_url in pdfs.items():
+                dest_path = os.path.join(args.outdir, f"{plan_id}_{doc_label}.pdf")
+                ok = download_pdf(session, pdf_url, dest_path)
+                if ok:
+                    if doc_label == "Summary_of_Benefits":
+                        row["SOB_pdf_link"] = pdf_url
+                        row["SOB_pdf_filepath"] = dest_path
+                    elif doc_label == "Evidence_of_Coverage":
+                        row["EoC_pdf_link"] = pdf_url
+                        row["EoC_pdf_filepath"] = dest_path
+                    elif doc_label == "Drug_Formulary":
+                        row["formulary_pdf_link"] = pdf_url
+                        row["formulary_pdf_filepath"] = dest_path
+
+            out_writer.writerow(row)
+            out_fh.flush()
+
+    out_fh.close()
+
+
+if __name__ == "__main__":
+    main()
