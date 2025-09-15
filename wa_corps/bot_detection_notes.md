@@ -437,6 +437,123 @@ I'd like just clean measurements first, and auto-exit main once 5 PDFs in a row 
 
 -------------------------------------------------------------------------------
 
+Perfect 👍 — let’s make this *measurement-first* with a **fail-5 consecutive auto-exit** and a separate **measurements log** that persists across runs.
+
+Here’s how we’ll do it:
+
+---
+
+### 1. Add a global measurements file
+
+At the top of `ccfs_lookup.py`:
+
+```python
+MEASUREMENTS_FILE = LOG_DIR / "ccfs_measurements.csv"
+
+# ensure file has header if it doesn’t exist
+if not MEASUREMENTS_FILE.exists():
+    with MEASUREMENTS_FILE.open("w", encoding="utf-8", newline="") as f:
+        f.write("timestamp,total_ubis,successes,fails,blocks,elapsed_sec,first_block_idx\n")
+```
+
+---
+
+### 2. Track consecutive failures + auto-exit
+
+Inside `main()` loop:
+
+```python
+consecutive_failures = 0
+for i, ubi in enumerate(ubis_to_process, start=start_n):
+    status = process_ubi(driver, ubi, i, total)
+    log_progress(ubi, i, total, status)
+
+    if status.startswith("success"):
+        consecutive_failures = 0
+    elif status in ("fail", "blocked"):
+        consecutive_failures += 1
+    else:
+        consecutive_failures = 0
+
+    if consecutive_failures >= 5:
+        dual_log(f"[WARN] Hit 5 consecutive failures at UBI {ubi}. Auto-exiting for measurement run.")
+        break
+```
+
+Note: `process_ubi` should **return a string status**: `"success"`, `"fail"`, or `"blocked"`.
+
+---
+
+### 3. After run, append measurement row
+
+At the end of `main()`:
+
+```python
+end_time = time.time()
+elapsed_sec = int(end_time - start_time)
+
+# compute first_block_idx if any
+first_block_idx = None
+with LOG_FILE.open(encoding="utf-8") as f:
+    for line in f:
+        if "Status: blocked" in line:
+            try:
+                ubi_part = line.split("UBI")[1].split(":")[0].strip()
+                first_block_idx = ubi_part
+                break
+            except Exception:
+                pass
+
+with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
+    f.write(
+        f"{datetime.now().isoformat()},"
+        f"{total},{success_count},{fail_count},{1 if block_detected else 0},"
+        f"{elapsed_sec},{first_block_idx or ''}\n"
+    )
+
+dual_log(f"[INFO] Measurements appended to {MEASUREMENTS_FILE}")
+summarize_log()
+```
+
+---
+
+### 4. Adjust `process_ubi` return values
+
+At the bottom of `process_ubi`:
+
+```python
+# on success
+return "success"
+
+# on warn / no results
+return "fail"
+
+# if modal doc fetch clearly failed → treat as blocked
+return "blocked"
+
+# on TimeoutException
+return "fail"
+
+# on unexpected Exception
+return "fail"
+```
+
+---
+
+### 5. What you’ll get
+
+* **`ccfs_lookup.log`** → detailed per-UBI logs (console + file).
+* **`ccfs_measurements.csv`** → one row per run, easy to analyze across multiple runs. Example:
+
+```csv
+timestamp,total_ubis,successes,fails,blocks,elapsed_sec,first_block_idx
+2025-09-15T12:45:23,721607,104,7,1,900,105
+2025-09-15T13:10:42,721607,98,5,1,870,99
+```
+
+---
+
+Do you want me to also add a **CSV parser utility** (separate script, `analyze_measurements.py`) to graph or summarize thresholds across multiple runs, or would you rather keep it raw CSV for now?
 
 -------------------------------------------------------------------------------
 

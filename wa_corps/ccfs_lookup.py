@@ -72,6 +72,14 @@ formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+# --- progress tracking globals ---
+MEASUREMENTS_FILE = LOG_DIR / "ccfs_measurements.csv"
+
+# ensure file has header if it doesn’t exist
+if not MEASUREMENTS_FILE.exists():
+    with MEASUREMENTS_FILE.open("w", encoding="utf-8", newline="") as f:
+        f.write("timestamp,total_ubis,successes,fails,blocks,elapsed_sec,first_block_idx\n")
+        
 
 # -------------------- logging & progress tracking helpers --------------------
 
@@ -447,7 +455,7 @@ def process_ubi(driver, ubi: str, index: int, total: int):
             # Save the empty list page for forensics, then give up on this UBI
             save_html(ubi_dir / "list.html", driver.page_source)
             print(f"[WARN] No results for UBI {ubi}")
-            return
+            return f"fail: no results for UBI {ubi}"
 
         # Save list.html (with rows)
         save_html(ubi_dir / "list.html", driver.page_source)
@@ -459,7 +467,7 @@ def process_ubi(driver, ubi: str, index: int, total: int):
                 print(f"[INFO] Clicking: {business_name}")
         except TimeoutException:
             print(f"[ERROR] Could not click first result for UBI {ubi}")
-            return
+            return f"fail: Could not click first result for UBI {ubi}"
 
         # Wait for details panel
         wait_present(driver, (By.ID, "divBusinessInformation"))
@@ -483,11 +491,14 @@ def process_ubi(driver, ubi: str, index: int, total: int):
 
         # Re-save JSON (now with PDF path if found)
         out_path.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
+        return f"success for UBI {ubi}"
 
     except TimeoutException:
         print(f"[ERROR] Timeout for UBI {ubi}")
+        return f"fail: timeout for UBI {ubi}"
     except Exception as e:
         print(f"[ERROR] Unexpected error for UBI {ubi}: {e}")
+        return f"fail: exception for UBI {ubi}: {e}"
 
 
 # ----------------------- CLI & runner -----------------------
@@ -526,8 +537,50 @@ def main():
     with start_driver() as driver:
         # Ensure we load home once up-front (also prompts any CF/js to settle)
         driver.get(BASE_URL)
+        # If we hit 5 consecutive failures, assume blocking and exit early
+        consecutive_failures = 0
         for i, ubi in enumerate(slice_ubis, start=start_n):
-            process_ubi(driver, ubi, i, total)
+            status = process_ubi(driver, ubi, i, total)
+            log_progress(ubi, i, total, status)
+
+            if status.startswith("success"):
+                consecutive_failures = 0
+            elif status in ("fail", "blocked"):
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+
+            if consecutive_failures >= 5:
+                dual_log(f"[WARN] Hit 5 consecutive failures at UBI {ubi}. Auto-exiting for measurement run.")
+                break
+
+    # After all done, append measurements
+    end_time = time.time()
+    elapsed_sec = int(end_time - start_time)
+
+    # compute first_block_idx if any
+    first_block_idx = None
+    with LOG_FILE.open(encoding="utf-8") as f:
+        for line in f:
+            if "Status: blocked" in line:
+                try:
+                    ubi_part = line.split("UBI")[1].split(":")[0].strip()
+                    first_block_idx = ubi_part
+                    break
+                except Exception:
+                    pass
+
+    with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
+        f.write(
+            f"{datetime.now().isoformat()},"
+            f"{total},{success_count},{fail_count},{1 if block_detected else 0},"
+            f"{elapsed_sec},{first_block_idx or ''}\n"
+        )
+
+    dual_log(f"[INFO] Measurements appended to {MEASUREMENTS_FILE}")
+    summarize_log()
+
+
 
 
 if __name__ == "__main__":
