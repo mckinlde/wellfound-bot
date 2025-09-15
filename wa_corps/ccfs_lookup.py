@@ -236,7 +236,7 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         annual_report_rows = [r for r in rows if "ANNUAL REPORT" in r.text.upper()]
         if not annual_report_rows:
             print(f"[WARN] No Annual Report rows found for {ubi}")
-            return
+            return "fail: no annual report rows found for UBI {ubi}"
 
         # The first row is the most recent
         most_recent_row = annual_report_rows[0]
@@ -248,13 +248,18 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.modal-dialog"))
         )
         time.sleep(1.0)
+        
+        # if modal clearly failed to open → treat as blocked
+        if not modal.is_displayed():
+            print(f"[WARN] Modal not displayed after clicking View Documents for {ubi}")
+            return "blocked: modal not displayed after clicking View Documents for UBI {ubi}"
 
         # Look for fulfilled Annual Reports in modal
         doc_rows = modal.find_elements(By.CSS_SELECTOR, "tbody tr")
         fulfilled = [r for r in doc_rows if "ANNUAL REPORT - FULFILLED" in r.text.upper()]
         if not fulfilled:
             print(f"[WARN] No fulfilled Annual Report found in modal for {ubi}")
-            return
+            return "fail: no fulfilled annual report found for UBI {ubi}"
 
         # Most recent = first row
         download_icon = fulfilled[0].find_element(By.CSS_SELECTOR, "i.fa-file-text-o")
