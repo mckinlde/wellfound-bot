@@ -7,6 +7,7 @@ Output : for each UBI
   - wa_corps/html_captures/{UBI}/list.html
   - wa_corps/html_captures/{UBI}/detail.html
   - wa_corps/business_json/{UBI}.json
+  - wa_corps/business_pdf/{UBI}/annual_report.pdf # we'll get contact info from here in postprocessing
 
 CLI slicing for parallel runs:
   --start_n N (1-based, inclusive)
@@ -34,13 +35,20 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from utils.driver_session import start_driver  # noqa
+from utils.SPA_utils import wait_scroll_interact, _safe_click_element
 
 # --- paths ---
 INPUT_CSV        = ROOT / "wa_corps" / "constants" / "Business Search Result.csv"
+
 HTML_CAPTURE_DIR = ROOT / "wa_corps" / "html_captures"
-JSON_OUTPUT_DIR  = ROOT / "wa_corps" / "business_json"
 HTML_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+
+JSON_OUTPUT_DIR  = ROOT / "wa_corps" / "business_json"
 JSON_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+BUSINESS_PDF_DIR = ROOT / "wa_corps" / "business_pdf"
+BUSINESS_PDF_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # --- config ---
 BASE_URL  = "https://ccfs.sos.wa.gov/"
@@ -103,6 +111,79 @@ def parse_detail_html(html: str, ubi: str) -> dict:
 
     return data
 
+
+def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
+    """
+    From the business detail page, navigate to Filing History, open most recent Annual Report,
+    and download the PDF if available.
+    """
+    try:
+        # Click Filing History
+        _safe_click_element(driver, driver.find_element(By.ID, "btnFilingHistory"), settle_delay=2)
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "table.table.table-responsive"))
+        )
+        time.sleep(1.5)
+
+        # Find all rows
+        rows = driver.find_elements(By.CSS_SELECTOR, "table.table.table-responsive tbody tr")
+        annual_report_rows = [
+            r for r in rows if "ANNUAL REPORT" in r.text.upper()
+        ]
+        if not annual_report_rows:
+            print(f"[INFO] No Annual Report rows found for {ubi}")
+            return
+
+        # The first row is the most recent
+        most_recent_row = annual_report_rows[0]
+        view_docs_link = most_recent_row.find_element(By.LINK_TEXT, "View Documents")
+        _safe_click_element(driver, view_docs_link, settle_delay=2)
+
+        # Wait for modal
+        modal = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.modal-dialog"))
+        )
+        time.sleep(1.0)
+
+        # Find fulfilled report rows in modal
+        doc_rows = modal.find_elements(By.CSS_SELECTOR, "tbody tr")
+        fulfilled = [
+            r for r in doc_rows if "ANNUAL REPORT - FULFILLED" in r.text.upper()
+        ]
+        if not fulfilled:
+            print(f"[INFO] No fulfilled Annual Report found in modal for {ubi}")
+            return
+
+        # First fulfilled entry = most recent
+        download_icon = fulfilled[0].find_element(By.CSS_SELECTOR, "i.fa-file-text-o")
+        _safe_click_element(driver, download_icon, settle_delay=2)
+
+        # Handle download (depends on browser profile)
+        # If using Firefox auto-download, file goes to default Downloads dir.
+        # Move it to wa_corps/business_pdf/{UBI}/annual_report.pdf
+        ubi_pdf_dir = BUSINESS_PDF_DIR / ubi.replace(" ", "")
+        ubi_pdf_dir.mkdir(parents=True, exist_ok=True)
+
+        # Poll for new PDF in Downloads
+        downloads = Path.home() / "Downloads"
+        for _ in range(30):  # wait up to ~30s
+            pdfs = sorted(downloads.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if pdfs:
+                newest = pdfs[0]
+                target = ubi_pdf_dir / "annual_report.pdf"
+                newest.replace(target)
+                json_data.setdefault("capture_paths", {})["annual_report_pdf"] = str(target)
+                print(f"[INFO] Saved annual report PDF → {target}")
+                return
+            time.sleep(1.0)
+
+        print(f"[WARN] Timed out waiting for PDF download for {ubi}")
+
+    except Exception as e:
+        print(f"[ERROR] Failed to save annual report for {ubi}: {e}")
+
+
+# ----------------------- Selenium helpers -----------------------
 
 def wait_clickable(driver, locator, timeout=WAIT_TIME):
     return WebDriverWait(driver, timeout).until(EC.element_to_be_clickable(locator))
@@ -271,6 +352,99 @@ def process_ubi(driver, ubi: str, index: int, total: int):
         out_path.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
         print(f"[INFO] Saved JSON → {out_path}")
 
+        # Click "Filing History" button: <input type="button" id="btnFilingHistory" class="btn btn-success" value="Filing History" ng-click="navBusinessFilings()">
+        # Args:
+        #     driver: Selenium WebDriver instance
+        #     by: locator type, e.g., By.CSS_SELECTOR
+        #     selector: element selector string
+        #     action: "click" (default) or "send_keys"
+        #     keys: text to send if action="send_keys"
+        #     timeout: max seconds to wait for element
+        #     settle_delay: pause after scrolling (for animations)
+        _safe_click_element(driver, driver.find_element(By.ID, "btnFilingHistory"), settle_delay=2)
+        time.sleep(2.0)  # let Angular finish
+
+        # Scan the business filing table: 
+        # #divBusinessInformation > div:nth-child(4) > div.row-margin > div > div > table > tbody:nth-child(3)
+        # 
+        # for the first "Annual Report" rowand click the "View Documents" link in that row to open the modal: 
+        # <tr ng-repeat="filing in businessFilings| orderBy:propertyName:reverse" class="ng-scope" style="">
+        #     <td class="ng-binding">0021617353</td>
+        #     <td class="ng-binding">02/01/2025 07:27:41 AM</td>
+
+        #     <td class="ng-binding">02/01/2025</td>
+        #     <!--<td>{{filing.ProcessedBy | uppercase}}</td>-->
+        #     <td ng-bind="filing.FilingTypeName" class="ng-binding">ANNUAL REPORT</td>
+        #     <!--<td ng-if="filing.DocumentId > 0">
+        #         <i class="fa fa-file-text-o fa-lg" style="cursor:pointer" filename="filing.FileName" params="filing" url="Common/DownloadFileByNumber?filingNo={{filing.FilingNumber}}" title="Download" download-file ng-bind="filing.FilingTypeName">
+        #             <span ng-bind="filing.FilingTypeName"></span>
+        #         </i>
+        #     </td>-->
+        #     <td>
+        #         <a class="btn-link" style="cursor:pointer" ng-click="getTransactionDocumentsList(filing.FilingNumber,filing.Transactionid,filing.FilingTypeName)">View Documents</a>
+        #     </td>
+        #     <!--<td ng-if="filing.DocumentId == 0"></td>-->
+        # </tr>
+        # 
+        #
+        # Then, in the modal, find the PDF link for the "ANNUAL REPORT - FULFILLED" and download it
+        # Modal with table inside of it: 
+        # 
+        # <div class="modal-dialog" style="width:80%;">
+        #     <div class="modal-content">
+        #         <div class="modal-header">
+        #             ...
+        #         </div>
+        #         <div class="searchresult modal-body" style="max-height:600px;overflow-y:auto;">
+        #             <div class="row table-responsive table-striped">
+        #                 <table style="width:100%" border="0" cellpadding="4" cellspacing="0" class="table table-responsive table-striped">
+        #                     <thead>
+        #                         <tr align="center" class="bg-primary text-center">
+        #                             <!--<th>File Name</th>-->
+        #                             <th>Document Type</th>
+        #                             <!--<th>Created By</th>-->
+        #                             <th>Created Date</th>
+        #                             <th>Action</th>
+        #                         </tr>
+        #                     </thead>
+        #                     <!-- ngRepeat: document in transactionDocumentsList --><!-- ngIf: document.DocumentTypeID!=2 --><tbody data-ng-repeat="document in transactionDocumentsList" data-ng-if="document.DocumentTypeID!=2" class="ng-scope" style="">
+        #                         <tr align="left" class="bgwhite">
+        #                             <!--<td><span data-ng-bind="document.CorrespondenceFileName"></span></td>-->
+        #                             <td><span data-ng-bind="document.DocumentTypeName" class="ng-binding">ANNUAL REPORT - FULFILLED</span></td>
+        #                             <!--<td><span data-ng-bind="document.UserName"></span></td>-->
+        #                             <td><span data-ng-bind="document.FilingDateTime | date:'MM/dd/yyyy'" class="ng-binding">02/01/2025</span></td>
+        #                             <td>
+        #                                 <i class="fa fa-file-text-o fa-lg ng-binding ng-isolate-scope ng-scope" style="cursor:pointer" filename="document.CorrespondenceFileName" params="document" url="Common/DownloadOnlineFilesByNumber?fileName=&amp;CorrespondenceFileName=&amp;DocumentTypeId=" title="Download/Print" download-file="" ng-bind="document.CorrespondenceFileName" ng-click="downloadPdf()"></i>
+        #                             </td>
+        #                         </tr>
+        #                     ...
+        #                     <tbody data-ng-hide="transactionDocumentsList.length&gt;0" class="ng-hide" style="">
+        #                         <tr><td colspan="5" ng-bind="messages.RegisteredAgent.emptyRecordsMsg" class="ng-binding">No Value Found.</td></tr>
+        #                     </tbody>
+        #                 </table>
+        #             </div>
+        #         </div>
+        #     </div>
+        # </div>
+        #
+        # table row of interest:
+        # <tr align="left" class="bgwhite">
+        #     <!--<td><span data-ng-bind="document.CorrespondenceFileName"></span></td>-->
+        #     <td><span data-ng-bind="document.DocumentTypeName" class="ng-binding">ANNUAL REPORT - FULFILLED</span></td>
+        #     <!--<td><span data-ng-bind="document.UserName"></span></td>-->
+        #     <td><span data-ng-bind="document.FilingDateTime | date:'MM/dd/yyyy'" class="ng-binding">02/01/2025</span></td>
+        #     <td>
+        #         <i class="fa fa-file-text-o fa-lg ng-binding ng-isolate-scope ng-scope" style="cursor:pointer" filename="document.CorrespondenceFileName" params="document" url="Common/DownloadOnlineFilesByNumber?fileName=&amp;CorrespondenceFileName=&amp;DocumentTypeId=" title="Download/Print" download-file="" ng-bind="document.CorrespondenceFileName" ng-click="downloadPdf()"></i>
+        #     </td>
+        # </tr>
+        #
+        # download button: <i class="fa fa-file-text-o fa-lg ng-binding ng-isolate-scope ng-scope" style="cursor:pointer" filename="document.CorrespondenceFileName" params="document" url="Common/DownloadOnlineFilesByNumber?fileName=&amp;CorrespondenceFileName=&amp;DocumentTypeId=" title="Download/Print" download-file="" ng-bind="document.CorrespondenceFileName" ng-click="downloadPdf()"></i>
+        # save the PDF to wa_corps/business_pdf/{UBI}/annual_report.pdf
+        # and record the path in the JSON output under "capture_paths.annual_report_pdf"
+        # Note: there may be multiple "ANNUAL REPORT - FULFILLED" entries; we want the most recent one (top of table)
+        # Note: there may be no "ANNUAL REPORT - FULFILLED" entry at all
+        # Finally, navigate back to the home page for the next UBI
+        # (we could also try to click a "Back" button, but this is more robust)
     except TimeoutException:
         print(f"[ERROR] Timeout for UBI {ubi}")
     except Exception as e:
