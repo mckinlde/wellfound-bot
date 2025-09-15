@@ -155,7 +155,11 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         download_icon = fulfilled[0].find_element(By.CSS_SELECTOR, "i.fa-file-text-o")
 
         # Don't worry about the expected filename; we're just gonna static sleep and grab the newest PDF in ~/Downloads every time.
+        # Note: if multiple downloads happen in parallel, this could grab the wrong one. So don't do that.
 
+        # mark a threshold BEFORE clicking
+        threshold = time.time()
+        print(f"[DEBUG] Threshold time before download click: {threshold}")
         # Click to trigger download
         try:
             _safe_click_element(driver, download_icon, settle_delay=2)
@@ -173,7 +177,9 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         # and also to avoid racing with Browser's renaming of the file after download completes.
         time.sleep(5)
         print(f"[INFO] Waited 5 sec for download to finish for {ubi}")
-        
+        # I'm still getting [WARN] Timed out waiting for annual report PDF for some reason, so there must be something wrong with
+        # how we grab the newest PDF in Downloads below.
+
         # Prepare output dir
         ubi_pdf_dir = BUSINESS_PDF_DIR / ubi.replace(" ", "")
         ubi_pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -184,19 +190,29 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         end_time = time.time() + 60
 
         # Just always grab the newest PDF
-        seen = {p: p.stat().st_mtime for p in downloads.glob("*.pdf")}
         while time.time() < end_time:
-            pdfs = sorted(downloads.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+            # look for any PDF newer than threshold
+            pdfs = [p for p in downloads.glob("*.pdf") if p.stat().st_mtime > threshold]
+            # Instead of trying to track filenames, we just say:
+            # “anything written to ~/Downloads after the click is ours.”
+            # This works whether the browser overwrote an old filename or created …(1).pdf.
+            # The 5-second buffer gives Firefox/Chrome time to finish renaming .part → .pdf.
             if pdfs:
-                newest = pdfs[0]
-                if newest not in seen or newest.stat().st_mtime != seen[newest]:
-                    newest.replace(target)
-                    json_data.setdefault("capture_paths", {})["annual_report_pdf"] = str(target)
-                    print(f"[INFO] Saved annual report PDF → {target}")
-                    return
-            time.sleep(1.0)
+                newest = max(pdfs, key=lambda p: p.stat().st_mtime)
+                newest.replace(target)
+                json_data.setdefault("capture_paths", {})["annual_report_pdf"] = str(target)
+                print(f"[INFO] Saved annual report PDF → {target}")
+                return
+            time.sleep(1)
 
         print(f"[WARN] Timed out waiting for annual report PDF for {ubi}")
+        # 👉 If you still see [WARN], it means your browser profile isn’t actually 
+        # writing to ~/Downloads. In that case, you’d want to set the Selenium 
+        # profile’s download.default_directory and point directly to BUSINESS_PDF_DIR.
+
+        # Want me to show you how to set Firefox profile so the PDF goes straight 
+        # into wa_corps/business_pdf/{UBI} without ever touching ~/Downloads? 
+        # That would avoid this whole polling loop.
 
     except Exception as e:
         print(f"[ERROR] Failed to save annual report for {ubi}: {e}")
