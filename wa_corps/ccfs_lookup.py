@@ -154,11 +154,12 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         # Most recent = first row
         download_icon = fulfilled[0].find_element(By.CSS_SELECTOR, "i.fa-file-text-o")
 
-        # Don't worry about the expected filename; just grab the newest PDF in ~/Downloads after click
+        # Don't worry about the expected filename; we're just gonna static sleep and grab the newest PDF in ~/Downloads every time.
 
         # Click to trigger download
         try:
             _safe_click_element(driver, download_icon, settle_delay=2)
+            print(f"[INFO] Clicked download icon for Annual Report for {ubi}")
         except TimeoutException:
             print("[WARN] First click attempt blocked, retrying after clearing overlays...")
             WebDriverWait(driver, 10).until_not(
@@ -171,6 +172,7 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         # We wait a fixed 5 sec here to ensure the file is fully written without needing to poll for .part
         # and also to avoid racing with Browser's renaming of the file after download completes.
         time.sleep(5)
+        print(f"[INFO] Waited 5 sec for download to finish for {ubi}")
         
         # Prepare output dir
         ubi_pdf_dir = BUSINESS_PDF_DIR / ubi.replace(" ", "")
@@ -181,8 +183,7 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         downloads = Path.home() / "Downloads"
         end_time = time.time() + 60
 
-        
-        # newest PDF
+        # Just always grab the newest PDF
         seen = {p: p.stat().st_mtime for p in downloads.glob("*.pdf")}
         while time.time() < end_time:
             pdfs = sorted(downloads.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
