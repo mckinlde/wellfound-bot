@@ -557,6 +557,164 @@ Do you want me to also add a **CSV parser utility** (separate script, `analyze_m
 
 -------------------------------------------------------------------------------
 
+You’re right—the early exit + traceback are from a few small wiring issues:
+
+1. `start_time` wasn’t initialized before `log_progress()` used it
+2. the counters (`success_count`, `fail_count`, `block_detected`) weren’t initialized
+3. your loop checks `elif status in ("fail","blocked"):` but your functions return strings like `"fail: …"` / `"blocked: …"`
+4. a few `return` strings in `save_latest_annual_report()` missed the leading `f`
+5. `summarize_log()` was called twice (end of `main()` **and** under `if __name__ == "__main__"`)
+
+Below are **surgical patches**—copy/paste as-is.
+
+---
+
+# 1) Initialize globals (top-level, near other globals)
+
+```python
+# --- progress tracking globals ---
+MEASUREMENTS_FILE = LOG_DIR / "ccfs_measurements.csv"
+
+# runtime / counters used by log_progress()
+start_time = None
+success_count = 0
+fail_count = 0
+block_detected = False
+```
+
+(Keep your existing MEASUREMENTS\_FILE header init below this.)
+
+---
+
+# 2) Fix `log_progress` (no logic change needed once globals exist)
+
+No code change here, but it now finds `start_time`, `success_count`, etc.
+
+---
+
+# 3) Set/Reset globals at start of `main()` and record start time
+
+```python
+def main():
+    global start_time, success_count, fail_count, block_detected
+    start_time = time.time()
+    success_count = 0
+    fail_count = 0
+    block_detected = False
+```
+
+Put those lines right after `def main():` and before parsing args.
+
+---
+
+# 4) Fix the loop’s failure/blocked detection
+
+Replace this block in `main()`:
+
+```python
+if status.startswith("success"):
+    consecutive_failures = 0
+elif status in ("fail", "blocked"):
+    consecutive_failures += 1
+else:
+    consecutive_failures = 0
+```
+
+with:
+
+```python
+if status and status.startswith("success"):
+    consecutive_failures = 0
+elif status and (status.startswith("fail") or status.startswith("blocked")):
+    consecutive_failures += 1
+else:
+    consecutive_failures = 0
+```
+
+---
+
+# 5) Make the three returns in `save_latest_annual_report()` real f-strings
+
+Find these three lines and change them:
+
+```python
+return "fail: no annual report rows found for UBI {ubi}"
+return "blocked: modal not displayed after clicking View Documents for UBI {ubi}"
+return "fail: no fulfilled annual report found for UBI {ubi}"
+```
+
+→
+
+```python
+return f"fail: no annual report rows found for UBI {ubi}"
+return f"blocked: modal not displayed after clicking View Documents for UBI {ubi}"
+return f"fail: no fulfilled annual report found for UBI {ubi}"
+```
+
+Everything else in that function already uses `f""`.
+
+---
+
+# 6) Avoid double summary (remove the extra call at the bottom)
+
+At the very end of the file, change:
+
+```python
+if __name__ == "__main__":
+    main()
+    summarize_log()
+```
+
+→
+
+```python
+if __name__ == "__main__":
+    main()
+```
+
+(`main()` already calls `summarize_log()`.)
+
+---
+
+# 7) (Optional, but nice) Use the processed slice size in measurements
+
+In `main()` where you append to `MEASUREMENTS_FILE`, you currently write `total` (all UBIs in CSV). If you want per-run math to be cleaner, replace `total` with `len(slice_ubis)`:
+
+```python
+with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
+    f.write(
+        f"{datetime.now().isoformat()},"
+        f"{len(slice_ubis)},{success_count},{fail_count},{1 if block_detected else 0},"
+        f"{elapsed_sec},{first_block_idx or ''}\n"
+    )
+```
+
+---
+
+After these edits:
+
+* `start_time` exists when `log_progress()` runs
+* counters are properly tracked across the run
+* statuses are correctly classified as fail/blocked even with extra text
+* f-strings display real UBIs
+* no duplicate summary calls
+
+Shout if you want me to fold in a small guard so `first_block_idx` is derived more robustly (right now it scrapes from the log line; we could instead pass the index into `log_progress` and stash the first “blocked” index directly).
+
+-------------------------------------------------------------------------------
+
+
+-------------------------------------------------------------------------------
+
+
+-------------------------------------------------------------------------------
+
+
+-------------------------------------------------------------------------------
+
+
+-------------------------------------------------------------------------------
+
 
 -------------------------------------------------------------------------------
 

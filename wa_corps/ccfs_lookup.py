@@ -76,6 +76,12 @@ logger.addHandler(handler)
 # --- progress tracking globals ---
 MEASUREMENTS_FILE = LOG_DIR / "ccfs_measurements.csv"
 
+# runtime / counters used by log_progress()
+start_time = None
+success_count = 0
+fail_count = 0
+block_detected = False
+
 # ensure file has header if it doesn’t exist
 if not MEASUREMENTS_FILE.exists():
     with MEASUREMENTS_FILE.open("w", encoding="utf-8", newline="") as f:
@@ -236,7 +242,7 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         annual_report_rows = [r for r in rows if "ANNUAL REPORT" in r.text.upper()]
         if not annual_report_rows:
             print(f"[WARN] No Annual Report rows found for {ubi}")
-            return "fail: no annual report rows found for UBI {ubi}"
+            return f"fail: no annual report rows found for UBI {ubi}"
 
         # The first row is the most recent
         most_recent_row = annual_report_rows[0]
@@ -252,14 +258,14 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         # if modal clearly failed to open → treat as blocked
         if not modal.is_displayed():
             print(f"[WARN] Modal not displayed after clicking View Documents for {ubi}")
-            return "blocked: modal not displayed after clicking View Documents for UBI {ubi}"
+            return f"blocked: modal not displayed after clicking View Documents for UBI {ubi}"
 
         # Look for fulfilled Annual Reports in modal
         doc_rows = modal.find_elements(By.CSS_SELECTOR, "tbody tr")
         fulfilled = [r for r in doc_rows if "ANNUAL REPORT - FULFILLED" in r.text.upper()]
         if not fulfilled:
             print(f"[WARN] No fulfilled Annual Report found in modal for {ubi}")
-            return "fail: no fulfilled annual report found for UBI {ubi}"
+            return f"fail: no fulfilled annual report found for UBI {ubi}"
 
         # Most recent = first row
         download_icon = fulfilled[0].find_element(By.CSS_SELECTOR, "i.fa-file-text-o")
@@ -514,6 +520,12 @@ def process_ubi(driver, ubi: str, index: int, total: int):
 # ----------------------- CLI & runner -----------------------
 
 def main():
+    global start_time, success_count, fail_count, block_detected
+    start_time = time.time()
+    success_count = 0
+    fail_count = 0
+    block_detected = False
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--start_n", type=int, default=1, help="Start index (1-based)")
     parser.add_argument("--stop_n", type=int, default=None, help="Stop index (inclusive)")
@@ -553,9 +565,9 @@ def main():
             status = process_ubi(driver, ubi, i, total)
             log_progress(ubi, i, total, status)
 
-            if status.startswith("success"):
+            if status and status.startswith("success"):
                 consecutive_failures = 0
-            elif status in ("fail", "blocked"):
+            elif status and (status.startswith("fail") or status.startswith("blocked")):
                 consecutive_failures += 1
             else:
                 consecutive_failures = 0
@@ -583,13 +595,13 @@ def main():
     with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
         f.write(
             f"{datetime.now().isoformat()},"
-            f"{total},{success_count},{fail_count},{1 if block_detected else 0},"
+            f"{len(slice_ubis)},{success_count},{fail_count},{1 if block_detected else 0},"
             f"{elapsed_sec},{first_block_idx or ''}\n"
         )
+
 
     dual_log(f"[INFO] Measurements appended to {MEASUREMENTS_FILE}")
     summarize_log()
 
 if __name__ == "__main__":
     main()
-    summarize_log()
