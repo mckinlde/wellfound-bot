@@ -314,13 +314,15 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
                 newest.replace(target)
                 json_data.setdefault("capture_paths", {})["annual_report_pdf"] = str(target)
                 print(f"[INFO] Saved annual report PDF → {target}")
-                return
+                return f"success, saved annual report PDF for UBI {ubi}"
             time.sleep(1)
 
         print(f"[WARN] Timed out waiting for annual report PDF for {ubi}")
+        return f"fail: timed out waiting for annual report PDF for UBI {ubi}"
 
     except Exception as e:
         print(f"[ERROR] Failed to save annual report for {ubi}: {e}")
+        return f"fail: exception saving annual report for UBI {ubi}: {e}"
 
 
 # ----------------------- Selenium helpers -----------------------
@@ -493,7 +495,9 @@ def process_ubi(driver, ubi: str, index: int, total: int):
         print(f"[INFO] Saved JSON → {out_path}")
 
         # Try to capture annual report PDF
-        save_latest_annual_report(driver, ubi, ubi_dir, json_data)
+        attempt = save_latest_annual_report(driver, ubi, ubi_dir, json_data)
+        if attempt and (attempt.startswith("fail") or attempt.startswith("blocked")):
+            return attempt  # propagate fail reason
 
         # Re-save JSON (now with PDF path if found)
         out_path.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
