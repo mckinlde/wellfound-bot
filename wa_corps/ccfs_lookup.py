@@ -112,14 +112,11 @@ def parse_detail_html(html: str, ubi: str) -> dict:
     return data
 
 
-"""I'm not sure I explained the problem correctly.
-
-The modal for annual reports opens correctly, and the download button is clicked correctly, and the download finishes just fine.  Still, the script will [WARN] for download timeout, even though the file is present / downloaded"""
-
 def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
     """
     From the business detail page, navigate to Filing History, open most recent Annual Report,
-    and download the PDF if available.
+    and download the PDF if available. Moves it into wa_corps/business_pdf/{UBI}/annual_report.pdf
+    and records the path in json_data["capture_paths"].
     """
     try:
         # Click Filing History
@@ -129,11 +126,9 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         )
         time.sleep(1.5)
 
-        # Find all rows
+        # Find all rows containing "ANNUAL REPORT"
         rows = driver.find_elements(By.CSS_SELECTOR, "table.table.table-responsive tbody tr")
-        annual_report_rows = [
-            r for r in rows if "ANNUAL REPORT" in r.text.upper()
-        ]
+        annual_report_rows = [r for r in rows if "ANNUAL REPORT" in r.text.upper()]
         if not annual_report_rows:
             print(f"[INFO] No Annual Report rows found for {ubi}")
             return
@@ -143,55 +138,54 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         view_docs_link = most_recent_row.find_element(By.LINK_TEXT, "View Documents")
         _safe_click_element(driver, view_docs_link, settle_delay=2)
 
-        # Wait for modal
+        # Wait for modal with transaction documents
         modal = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.modal-dialog"))
         )
         time.sleep(1.0)
 
-        # Find fulfilled report rows in modal
+        # Look for fulfilled Annual Reports in modal
         doc_rows = modal.find_elements(By.CSS_SELECTOR, "tbody tr")
-        fulfilled = [
-            r for r in doc_rows if "ANNUAL REPORT - FULFILLED" in r.text.upper()
-        ]
+        fulfilled = [r for r in doc_rows if "ANNUAL REPORT - FULFILLED" in r.text.upper()]
         if not fulfilled:
             print(f"[INFO] No fulfilled Annual Report found in modal for {ubi}")
             return
 
-        # First fulfilled entry = most recent
+        # Most recent = first row
         download_icon = fulfilled[0].find_element(By.CSS_SELECTOR, "i.fa-file-text-o")
 
+        # Grab the expected filename from the element (if present)
+        filename = download_icon.get_attribute("filename") or "AnnualReport.pdf"
+
+        # Click to trigger download
         try:
             _safe_click_element(driver, download_icon, settle_delay=2)
         except TimeoutException:
             print("[WARN] First click attempt blocked, retrying after clearing overlays...")
-            # Wait for overlay/backdrop to vanish
             WebDriverWait(driver, 10).until_not(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "div.modal-backdrop"))
             )
             driver.execute_script("arguments[0].click();", download_icon)
             time.sleep(2.0)
 
-        # Handle download (depends on browser profile)
-        # If using Firefox auto-download, file goes to default Downloads dir.
-        # Move it to wa_corps/business_pdf/{UBI}/annual_report.pdf
+        # Prepare output dir
         ubi_pdf_dir = BUSINESS_PDF_DIR / ubi.replace(" ", "")
         ubi_pdf_dir.mkdir(parents=True, exist_ok=True)
 
-        # Poll for new PDF in Downloads
+        # Poll specifically for the expected filename in ~/Downloads
         downloads = Path.home() / "Downloads"
-        for _ in range(30):  # wait up to ~30s
-            pdfs = sorted(downloads.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if pdfs:
-                newest = pdfs[0]
-                target = ubi_pdf_dir / "annual_report.pdf"
-                newest.replace(target)
+        target = ubi_pdf_dir / "annual_report.pdf"
+        end_time = time.time() + 60
+        while time.time() < end_time:
+            pdf_path = downloads / filename
+            if pdf_path.exists() and pdf_path.stat().st_size > 0:
+                pdf_path.replace(target)
                 json_data.setdefault("capture_paths", {})["annual_report_pdf"] = str(target)
                 print(f"[INFO] Saved annual report PDF → {target}")
                 return
             time.sleep(1.0)
 
-        print(f"[WARN] Timed out waiting for PDF download for {ubi}")
+        print(f"[WARN] Timed out waiting for annual report PDF for {ubi}")
 
     except Exception as e:
         print(f"[ERROR] Failed to save annual report for {ubi}: {e}")
