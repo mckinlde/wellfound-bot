@@ -390,6 +390,17 @@ def process_ubi(driver, ubi: str, index: int, total: int):
         # Try to capture annual report PDF
         save_latest_annual_report(driver, ubi, ubi_dir, json_data)
         # C:\Users\240SSD\AppData\Local\Temp\ff-profile-0mtvpn18\downloads
+        # Right now Selenium is spinning up a fresh temporary Firefox profile each run. 
+        # That profile has its own downloads folder under 
+        # %TEMP%\ff-profile-XXXX\downloads, 
+        # so your Path.home() / "Downloads" check will never see the files.
+        # To fix this while continuing to use the ephemeral profile,
+        # you can query the profile path with:
+        # profile_dir = Path(driver.capabilities['moz:profile'])
+        # downloads_dir = profile_dir / "downloads"
+        # then you change your polling code to look in downloads_dir instead of Path.home() / "Downloads".
+        # downloads = Path(driver.capabilities['moz:profile']) / "downloads"
+
         # Re-save JSON (now with PDF path if found)
         out_path.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
 
