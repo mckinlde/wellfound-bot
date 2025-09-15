@@ -113,12 +113,13 @@ def log_progress(ubi: str, index: int, total: int, status: str):
     elapsed = now - start_time
     elapsed_str = str(timedelta(seconds=int(elapsed)))
 
-    if status == "success":
+    if status.startswith("success"):
         success_count += 1
     elif status.startswith("fail"):
         fail_count += 1
-    elif status == "blocked":
+    elif status.startswith("blocked"):
         block_detected = True
+
 
     msg = (f"[LOG] {datetime.now().isoformat()} | "
            f"UBI {index}/{total}: {ubi} | "
@@ -143,20 +144,17 @@ def summarize_log(log_path: Path = LOG_FILE):
         for line in f:
             if "Status:" not in line:
                 continue
-            parts = line.strip().split("|")
-            if len(parts) < 4:
-                continue
-            status = parts[3].split(":")[-1].strip().lower()
-
-            if "success" in status:
+            low = line.lower()
+            if "success" in low:
                 successes += 1
-            elif "fail" in status:
+            elif "fail" in low:
                 fails += 1
-            elif "blocked" in status:
+            elif "blocked" in low:
                 blocks += 1
                 if first_block_idx is None:
                     first_block_idx = successes + fails
-                    first_block_time = parts[0]
+                    first_block_time = line.split("|")[0].strip()
+
 
     dual_log("==== SUMMARY ====", "info")
     dual_log(f"Total successes: {successes}", "info")
