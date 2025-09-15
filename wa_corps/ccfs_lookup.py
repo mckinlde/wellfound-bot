@@ -155,7 +155,11 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         download_icon = fulfilled[0].find_element(By.CSS_SELECTOR, "i.fa-file-text-o")
 
         # Grab the expected filename from the element (if present)
-        filename = download_icon.get_attribute("filename") or "AnnualReport.pdf"
+        filename = download_icon.get_attribute("filename")
+        if filename:
+            filename = filename.strip()
+        else:
+            filename = None  # fall back mode
 
         # Click to trigger download
         try:
@@ -171,19 +175,33 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         # Prepare output dir
         ubi_pdf_dir = BUSINESS_PDF_DIR / ubi.replace(" ", "")
         ubi_pdf_dir.mkdir(parents=True, exist_ok=True)
-
-        # Poll specifically for the expected filename in ~/Downloads
-        downloads = Path.home() / "Downloads"
         target = ubi_pdf_dir / "annual_report.pdf"
+
+        # Poll for PDF in ~/Downloads
+        downloads = Path.home() / "Downloads"
         end_time = time.time() + 60
-        while time.time() < end_time:
-            pdf_path = downloads / filename
-            if pdf_path.exists() and pdf_path.stat().st_size > 0:
-                pdf_path.replace(target)
-                json_data.setdefault("capture_paths", {})["annual_report_pdf"] = str(target)
-                print(f"[INFO] Saved annual report PDF → {target}")
-                return
-            time.sleep(1.0)
+
+        if filename:  # explicit filename mode
+            while time.time() < end_time:
+                pdf_path = downloads / filename
+                if pdf_path.exists() and pdf_path.stat().st_size > 0:
+                    pdf_path.replace(target)
+                    json_data.setdefault("capture_paths", {})["annual_report_pdf"] = str(target)
+                    print(f"[INFO] Saved annual report PDF → {target}")
+                    return
+                time.sleep(1.0)
+        else:  # fallback mode: newest PDF
+            seen = {p: p.stat().st_mtime for p in downloads.glob("*.pdf")}
+            while time.time() < end_time:
+                pdfs = sorted(downloads.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if pdfs:
+                    newest = pdfs[0]
+                    if newest not in seen or newest.stat().st_mtime != seen[newest]:
+                        newest.replace(target)
+                        json_data.setdefault("capture_paths", {})["annual_report_pdf"] = str(target)
+                        print(f"[INFO] Saved annual report PDF (fallback) → {target}")
+                        return
+                time.sleep(1.0)
 
         print(f"[WARN] Timed out waiting for annual report PDF for {ubi}")
 
