@@ -112,6 +112,10 @@ def parse_detail_html(html: str, ubi: str) -> dict:
     return data
 
 
+"""I'm not sure I explained the problem correctly.
+
+The modal for annual reports opens correctly, and the download button is clicked correctly, and the download finishes just fine.  Still, the script will [WARN] for download timeout, even though the file is present / downloaded"""
+
 def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
     """
     From the business detail page, navigate to Filing History, open most recent Annual Report,
@@ -156,7 +160,17 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
 
         # First fulfilled entry = most recent
         download_icon = fulfilled[0].find_element(By.CSS_SELECTOR, "i.fa-file-text-o")
-        _safe_click_element(driver, download_icon, settle_delay=2)
+
+        try:
+            _safe_click_element(driver, download_icon, settle_delay=2)
+        except TimeoutException:
+            print("[WARN] First click attempt blocked, retrying after clearing overlays...")
+            # Wait for overlay/backdrop to vanish
+            WebDriverWait(driver, 10).until_not(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div.modal-backdrop"))
+            )
+            driver.execute_script("arguments[0].click();", download_icon)
+            time.sleep(2.0)
 
         # Handle download (depends on browser profile)
         # If using Firefox auto-download, file goes to default Downloads dir.
