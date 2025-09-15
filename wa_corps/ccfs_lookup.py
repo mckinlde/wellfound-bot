@@ -82,6 +82,10 @@ success_count = 0
 fail_count = 0
 block_detected = False
 
+# NEW:
+block_count = 0
+first_block_at_index = None
+
 # ensure file has header if it doesn’t exist
 if not MEASUREMENTS_FILE.exists():
     with MEASUREMENTS_FILE.open("w", encoding="utf-8", newline="") as f:
@@ -105,28 +109,33 @@ def dual_log(message: str, level: str = "info"):
     else:
         logger.info(message)
 
-# progress tracking globals
+# counter incrementing and progress logging helper
 def log_progress(ubi: str, index: int, total: int, status: str):
-    global success_count, fail_count, block_detected
+    global success_count, fail_count, block_detected, block_count, first_block_at_index
 
     now = time.time()
     elapsed = now - start_time
     elapsed_str = str(timedelta(seconds=int(elapsed)))
 
-    if status.startswith("success"):
-        success_count += 1
-    elif status.startswith("fail"):
-        fail_count += 1
-    elif status.startswith("blocked"):
-        block_detected = True
+    s = (status or "").lower()
 
+    if s.startswith("success"):
+        success_count += 1
+    elif s.startswith("fail"):
+        fail_count += 1
+    elif s.startswith("blocked"):
+        block_detected = True
+        block_count += 1
+        if first_block_at_index is None:
+            first_block_at_index = index  # record the first index we saw a block
 
     msg = (f"[LOG] {datetime.now().isoformat()} | "
            f"UBI {index}/{total}: {ubi} | "
            f"Status: {status} | "
            f"Elapsed: {elapsed_str} | "
-           f"Success: {success_count} | Fail: {fail_count}")
+           f"Success: {success_count} | Fail: {fail_count} | Blocked: {block_count}")
     dual_log(msg)
+
 
 # log summary helper
 def summarize_log(log_path: Path = LOG_FILE):
@@ -144,16 +153,22 @@ def summarize_log(log_path: Path = LOG_FILE):
         for line in f:
             if "Status:" not in line:
                 continue
-            low = line.lower()
-            if "success" in low:
+            # Extract only the status segment after "Status:" and before the next '|'
+            try:
+                status_seg = line.split("Status:", 1)[1].split("|", 1)[0].strip().lower()
+            except Exception:
+                continue
+
+            if status_seg.startswith("success"):
                 successes += 1
-            elif "fail" in low:
+            elif status_seg.startswith("fail"):
                 fails += 1
-            elif "blocked" in low:
+            elif status_seg.startswith("blocked"):
                 blocks += 1
                 if first_block_idx is None:
+                    # Count of requests before first block
                     first_block_idx = successes + fails
-                    first_block_time = line.split("|")[0].strip()
+                    first_block_time = line.split("|", 1)[0].strip()
 
 
     dual_log("==== SUMMARY ====", "info")
@@ -518,11 +533,13 @@ def process_ubi(driver, ubi: str, index: int, total: int):
 # ----------------------- CLI & runner -----------------------
 
 def main():
-    global start_time, success_count, fail_count, block_detected
+    global start_time, success_count, fail_count, block_detected, block_count, first_block_at_index
     start_time = time.time()
     success_count = 0
     fail_count = 0
     block_detected = False
+    block_count = 0                 # NEW
+    first_block_at_index = None     # NEW
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--start_n", type=int, default=1, help="Start index (1-based)")
@@ -578,28 +595,16 @@ def main():
     end_time = time.time()
     elapsed_sec = int(end_time - start_time)
 
-    # compute first_block_idx if any
-    first_block_idx = None
-    with LOG_FILE.open(encoding="utf-8") as f:
-        for line in f:
-            if "Status: blocked" in line:
-                try:
-                    ubi_part = line.split("UBI")[1].split(":")[0].strip()
-                    first_block_idx = ubi_part
-                    break
-                except Exception:
-                    pass
-
     with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
         f.write(
             f"{datetime.now().isoformat()},"
-            f"{len(slice_ubis)},{success_count},{fail_count},{1 if block_detected else 0},"
-            f"{elapsed_sec},{first_block_idx or ''}\n"
+            f"{len(slice_ubis)},{success_count},{fail_count},{block_count},"
+            f"{elapsed_sec},{first_block_at_index or ''}\n"
         )
-
 
     dual_log(f"[INFO] Measurements appended to {MEASUREMENTS_FILE}")
     summarize_log()
+
 
 if __name__ == "__main__":
     main()
