@@ -1,0 +1,18 @@
+Hang on, we're still arguing over execution priority.  I'll use the example log to show desired behavior:
+
+[INFO] (25/64558) Searching PDFs for H1234-567-8 Some Plan Name
+[INFO] Broad search found 2/3 docs (SoB, Formulary; missing EoC)
+[DOWNLOAD] Saving Formulary → .../H1234-567-8_Drug_Formulary.pdf
+[DOWNLOAD] Saving SoB → .../H1234-567-8_Summary_of_Benefits.pdf
+[INFO] Targeted search for Evidence_of_Coverage succeeded
+[DOWNLOAD] Saving EoC → .../H1234-567-8_Evidence_of_Coverage.pdf
+[SUMMARY] (25/64558) H1234-567-8 → SoB=FOUND, EoC=FOUND, Formulary=FOUND
+
+[INFO] (26/64558) Searching PDFs for H2345-678-9 Some Plan Name
+[INFO] Broad search found 1/3 docs (EoC; missing SoB, Formulary)
+[DOWNLOAD] Saving EoC → .../H2345-678-9_Evidence_of_Coverage.pdf
+[INFO] Targeted search for Summary_of_Benefits succeeded
+[DOWNLOAD] Saving SoB → .../H2345-678-9_Summary_of_Benefits.pdf
+[INFO] Targeted search for Drug_Formulary succeeded
+[DOWNLOAD] Saving Formulary → .../H2345-678-9_Drug_Formulary.pdf
+[SUMMARY] (26/64558) H2345-678-9 → SoB=FOUND, EoC=FOUND, Formulary=FOUND

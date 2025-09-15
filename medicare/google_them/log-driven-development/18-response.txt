@@ -1,0 +1,73 @@
+I looked inside the saved HTML you uploaded, and I can see why your script is returning “0 PDF links scanned.”
+
+Your current parser only extracts `<a>` elements where `href` starts with `/url?`. On this page, however, the actual search result links aren’t structured that way — Google has changed their markup again. The anchors you want are wrapped in a container like:
+
+```html
+<div class="yuRUbf">
+  <a href="https://www.cigna.com/medicare/medicare-advantage/2025/summary-of-benefits/H4513-077-3.pdf">
+    <h3 class="LC20lb">…Summary of Benefits…</h3>
+  </a>
+</div>
+```
+
+So there are two issues:
+
+1. **Different link format** – instead of `/url?q=…`, the `<a>` contains the real PDF URL directly in `href`.
+2. **Your filter is too strict** – `extract_google_links_with_text()` skips all anchors that don’t start with `/url?`.
+
+---
+
+### Fix
+
+You can broaden your link extractor so it catches both types:
+
+```python
+def extract_google_links_with_text(soup):
+    """
+    Yield (real_url, anchor_text) pairs from Google result links.
+    Handle both /url?q=… wrappers and direct <a href="…"> cases.
+    """
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+
+        # Case 1: /url?q=… redirect links
+        if href.startswith("/url?"):
+            qs = parse_qs(urlparse(href).query)
+            real = qs.get("q", [""])[0]
+        else:
+            # Case 2: direct links (Google sometimes uses them now)
+            real = href
+
+        if not real:
+            continue
+
+        text = a.get_text(" ", strip=True) or ""
+        yield real, text
+```
+
+This way, you’ll capture both redirect-style and direct PDF URLs.
+
+---
+
+### Debugging Tip
+
+Since Google markup changes frequently, it helps to log **every anchor** you extract for one test run:
+
+```python
+for real_url, anchor_text in extract_google_links_with_text(soup):
+    print("[DEBUG] link:", real_url, "| text:", anchor_text)
+```
+
+That will let you verify if PDF links are present but just not categorized.
+
+---
+
+### Next Steps
+
+1. Update `extract_google_links_with_text()` as above.
+2. Run your script again on the saved HTML (`H4513-077-3 Cigna Preferred Medicare…htm`).
+3. Check the console — you should now see PDF links show up and get categorized.
+
+---
+
+Do you want me to patch your script so you can drop in the fixed `extract_google_links_with_text()` function directly?

@@ -1,0 +1,67 @@
+You’ve nailed the diagnosis:
+
+Right now, when you hit a CAPTCHA and solve it, the script doesn’t *re-parse* the search results page before continuing. It’s still holding onto the old soup object created **before** you solved the challenge, so it sees “0 PDFs” and moves on. That’s why you see the page clearly has SoB, EoC, and Formulary, but the script reports “NOT FOUND.”
+
+We need two fixes:
+
+---
+
+### 1. After CAPTCHA, re-fetch and re-parse
+
+Instead of just `soup = BeautifulSoup(driver.page_source, "html.parser")` right after `input()`, we should **force another small wait and re-parse** once Google has redirected back to the search results page.
+
+Something like:
+
+```python
+if soup.select_one("#recaptcha-anchor") or "recaptcha" in driver.page_source.lower():
+    input("[ACTION] CAPTCHA detected. Solve it in the browser, then press Enter here to continue...")
+    # Give Google a chance to load the results after captcha
+    polite_sleep()
+    # Re-parse the (now real) search results page
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+```
+
+Optionally, also verify that at least one `<div class="g">` or `<a href="/url?">` is present before continuing.
+
+---
+
+### 2. More explicit logging
+
+We should log *every search page* as it happens, and also log the PDF links found. For example:
+
+```
+[SEARCH] H4513-077-3 broad, page 1 → found 2 links
+    [CANDIDATE] Summary_of_Benefits → https://www.cigna.com/docs/sb-h4513-077-003.pdf
+    [CANDIDATE] Evidence_of_Coverage → https://www.cigna.com/docs/eoc-h4513-077-003.pdf
+```
+
+That way you’ll see **what was actually parsed**, and if categorization failed you’ll have evidence in the logs.
+
+---
+
+### 3. No crash on “not found”
+
+Right now the summary line is trying to build keys like `Summary_pdf_link` which don’t exist when nothing is found. We’ll fix that by explicitly using the row’s keys and defaulting to “NOT FOUND” if missing:
+
+```python
+summary = []
+for doc_label in DOC_TYPES.keys():
+    link_field = {
+        "Summary_of_Benefits": "SOB_pdf_link",
+        "Evidence_of_Coverage": "EoC_pdf_link",
+        "Drug_Formulary": "formulary_pdf_link",
+    }[doc_label]
+    summary.append(f"{doc_label}={'FOUND' if row.get(link_field) else 'NOT FOUND'}")
+print(f"[SUMMARY] ({idx}/{total}) {plan_id} → " + ", ".join(summary))
+```
+
+---
+
+👉 If you like, I can send you a **patched full script** that:
+
+* Forces re-parse after CAPTCHA.
+* Adds `[SEARCH]` and `[CANDIDATE]` logs.
+* Fixes the summary builder to avoid crashing.
+* Ensures we download what’s found **before** moving to targeted searches.
+
+Would you like me to drop in that full updated version now?

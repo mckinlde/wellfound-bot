@@ -1,0 +1,70 @@
+Got it 👍 — you’re right: in the current flow the code **downloads immediately after the broad search results** are merged into `results`. Only *afterwards* does it try targeted searches for the missing document types.
+
+That means:
+
+* The log just shows “downloaded X.pdf” without telling you if Y/Z were still missing.
+* You don’t see a clear per-plan summary of which doc types were found vs missing.
+
+Here’s how I’d improve it:
+
+---
+
+### Implementation Plan for Better Logging
+
+1. **Change flow**:
+
+   * Run broad search.
+   * Run targeted searches for missing doc types.
+   * Only then perform the downloads.
+     This way downloads happen *after* the script has the complete picture for the plan.
+
+2. **Add explicit logs**:
+
+   * Log the count of found docs after the broad search, e.g.
+
+     ```
+     [INFO] Broad search for H1234-567-8 → found 2/3 docs (SoB, Formulary; missing EoC)
+     ```
+   * Log again after targeted searches:
+
+     ```
+     [INFO] After targeted searches → found all 3/3 docs
+     ```
+   * If something’s still missing:
+
+     ```
+     [WARN] Plan H1234-567-8 still missing Evidence_of_Coverage
+     ```
+
+3. **Per-plan summary** (at the end of the loop):
+
+   ```
+   [SUMMARY] H1234-567-8 → SoB=FOUND, EoC=MISSING, Formulary=FOUND
+   ```
+
+4. **Downloads**:
+
+   * Perform downloads after the summary, so you know exactly what’s being pulled.
+   * Add logging of the target path, e.g.
+
+     ```
+     [DOWNLOAD] Saving SoB → medicare/google_them/H1234-567-8_Summary_of_Benefits.pdf
+     ```
+
+---
+
+### Example Log Output (new flow)
+
+```
+[INFO] (25/64558) Searching PDFs for H1234-567-8 Some Plan Name
+[INFO] Broad search found 2/3 docs (SoB, Formulary; missing EoC)
+[INFO] Targeted search for Evidence_of_Coverage succeeded
+[SUMMARY] H1234-567-8 → SoB=FOUND, EoC=FOUND, Formulary=FOUND
+[DOWNLOAD] Saving SoB → .../H1234-567-8_Summary_of_Benefits.pdf
+[DOWNLOAD] Saving EoC → .../H1234-567-8_Evidence_of_Coverage.pdf
+[DOWNLOAD] Saving Formulary → .../H1234-567-8_Drug_Formulary.pdf
+```
+
+---
+
+Would you like me to **send back a full updated script** with these changes baked in (delayed downloads + explicit logs + summaries)? That way you can just drop it in and run.

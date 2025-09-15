@@ -1,3 +1,19 @@
+I started a new chat so I can upload files.  Read UHC_pdf_grabber to catch up.  Here's the html of the first page of results.  The script is not finding the pdf links on parsing.  Here's the console output:
+```
+
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> python medicare/google_them/pdf_grabber.py --input medicare/plan_links.csv --output medicare/google_them/testrun/cigna_pdfs.csv --outdir medicare/google_them/testrun --start 1                
+Could not find platform independent libraries <prefix>
+[INFO] (1/64558) Searching PDFs for H4513-077-3 Cigna Preferred Medicare (HMO)
+[SEARCH] H4513-077-3 broad, page 1 → https://www.google.com/search?q=H4513-077-3+Cigna+Preferred+Medicare+%28HMO%29+filetype%3Apdf&hl=en&num=10&start=0
+[ACTION] CAPTCHA detected. Solve it in the browser, then press Enter here to continue...
+[DEBUG] Re-parsed broad page 1 after captcha solve
+[PARSE] broad page 1: 0 PDF links scanned, 0 categorized
+[SEARCH] H4513-077-3 broad, page 2 → https://www.google.com/search?q=H4513-077-3+Cigna+Preferred+Medicare+%28HMO%29+filetype%3Apdf&hl=en&num=10&start=10
+```
+
+
+And the full script:
+```
 import os
 import csv
 import time
@@ -71,24 +87,16 @@ def save_html(html_dir, plan_id, label, page, html, suffix=""):
 def extract_google_links_with_text(soup):
     """
     Yield (real_url, anchor_text) pairs from Google result links.
-    Handle both /url?q=… wrappers and direct <a href="…"> cases.
+    We only look at /url?q=... wrappers (not cache/images/etc.).
     """
     for a in soup.select("a[href]"):
         href = a.get("href", "")
-
-        # Case 1: /url?q=… redirect links
         if href.startswith("/url?"):
             qs = parse_qs(urlparse(href).query)
             real = qs.get("q", [""])[0]
-        else:
-            # Case 2: direct links (Google sometimes uses them now)
-            real = href
-
-        if not real:
-            continue
-
-        text = a.get_text(" ", strip=True) or ""
-        yield real, text
+            if real:
+                text = a.get_text(" ", strip=True) or ""
+                yield real, text
 
 
 def is_pdf_url(u: str) -> bool:
@@ -160,7 +168,6 @@ def parse_and_categorize(driver, plan_id, query, html_dir, label="broad", page=1
     found = {}
     candidates = []
     for real_url, anchor_text in extract_google_links_with_text(soup):
-        #print("[DEBUG] link:", real_url, "| text:", anchor_text)
         if not is_pdf_url(real_url):
             continue
         candidates.append((real_url, anchor_text))
@@ -347,7 +354,4 @@ def main():
 if __name__ == "__main__":
     main()
 # Note: It's generally better to solve captchas with user input and script resuming afterwards.  Horizontal scaling probably involves multiplexing to many machines for captcha solving.
-
-# usage, from repo root:
-
-# python medicare/google_them/pdf_grabber.py --input medicare/plan_links.csv --output medicare/google_them/testrun/plan_pdfs.csv --outdir medicare/google_them/testrun --start 1
+```

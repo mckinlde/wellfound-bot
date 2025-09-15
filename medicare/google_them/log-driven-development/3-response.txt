@@ -1,0 +1,35 @@
+Perfect — thanks for clarifying with the log example.
+
+You want this execution order:
+
+1. **Broad search** → report how many of the 3 were found.
+2. **Immediately download** the ones found in the broad search.
+3. For each missing doc type:
+
+   * Run a targeted search.
+   * If found, log success and download immediately.
+4. **At the very end** print a clear `[SUMMARY]` line with all 3 statuses.
+
+That way you’re never holding onto results; you fetch → download → log as you go, but still end with a structured per-plan summary.
+
+---
+
+### How we’ll implement
+
+* **In `google_search_for_pdfs`**:
+
+  * Return two sets of results:
+
+    * `found` (broad search hits)
+    * `missing` (labels still needed)
+* In the plan loop:
+
+  * Log `[INFO] Broad search found X/3 ...`
+  * Iterate through `found` and call `download_pdf` right away (with explicit `[DOWNLOAD]` logs).
+  * Then loop over `missing`, run targeted searches, log `[INFO] Targeted search ...`, download if found.
+  * Track `status` for each of the 3 doc types (`FOUND`/`MISSING`) for the summary.
+* At the end of each plan, log a `[SUMMARY]` line exactly as in your example.
+
+---
+
+Would you like me to send back a **full updated script** now with this revised logging + flow (so your output matches your example log verbatim)?

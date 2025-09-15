@@ -1,0 +1,63 @@
+output up until captcha:
+```
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> python medicare/google_them/pdf_grabber.py --input medicare/plan_links.csv --output medicare/google_them/testrun/cigna_pdfs.csv --outdir medicare/google_them/testrun --start 1
+Could not find platform independent libraries <prefix>
+[INFO] (1/64558) Searching PDFs for H4513-077-3 Cigna Preferred Medicare (HMO)
+[ACTION] CAPTCHA detected. Solve it in the browser, then press Enter here to continue...
+```
+
+<then I solve captcha>
+
+Text of page for <url: https://www.google.com/search?q=H4513-077-3+Cigna+Preferred+Medicare+%28HMO%29+filetype%3Apdf&hl=en&num=10&start=0&sei=iGXHaO3HC-rGkPIPoLq8iA4> after solving captcha:
+```
+
+2024 Summary of Benefits
+Cigna
+https://www.cigna.com › docs › sb-h4513-077-003
+PDF
+Jan 1, 2024 — To join this plan, you must be entitled to. Medicare Part A, be enrolled in Medicare Part B, and live in our service area. Comparing coverage. If you want to compare our plan with other. Medicare health plans, ask the other plans for.
+16 pages
+Evidence of Coverage
+Cigna
+https://www.cigna.com › docs › eoc-h4513-077-003
+PDF
+Your Medicare Health Benefits and Services and Prescription Drug Coverage as a Member of Cigna. Preferred Medicare (HMO). This document gives you the details about your Medicare health care and prescription drug coverage from January 1 – December. 31, 2025. This is an important legal document.
+ANNUAL NOTICE OF CHANGES FOR 2025
+Cigna
+https://www.cigna.com › docs › anoc-h4513-077-003
+PDF
+To change to a different plan, you can switch plans between October 15 and December 7. Your new coverage will start on January 1, 2025. This will end your enrollment with Cigna Preferred Medicare (HMO).
+People also ask
+Does Cigna Preferred Medicare HMO require a referral?
+Is Cigna Medicare a PPO or HMO?
+What's the difference between Cigna HMO and PPO?
+What kind of insurance is Cigna HMO?
+Feedback
+2025 Medicare Advantage Plan Individual Enrollment ...
+MedicareAdvantage.com
+https://content.medicareadvantage.com › Cigna-Y00...
+PDF
+Sep 13, 2024 — Medicare Advantage plan (HMO) with a Part D drug benefit: Cigna Preferred Full Savings Medicare (HMO) H4513-089 – $0 per month. Cigna Preferred Medicare (HMO) H4513-077-003 – $0 per month. Cigna Preferred Plus Medicare (HMO) H4513-087-003 – $19 per month. Medicare Advantage plan (PPO) with a Part D ...
+Cigna Healthcare Comprehensive Drug List Formulary
+Cigna
+https://www.cigna.com › medicare › formulary-mapd
+PDF
+Sep 1, 2025 — HPMS Approved Formulary File Submission 00025271. This formulary was updated on 09/01/2025. For more recent informationor other questions, please contact Cigna Healthcare. Customer Service at 1-800-668-3813 (TTY 711), 8 a.m. – 8 p.m. local time, 7 days a week October - March, Monday to Friday.
+109 pages
+```
+
+<Then I return to terminal and press enter>
+
+After solving captcha, driver runs multiple searches without producing any more debug output.  (ToDo: log each search's text as [SEARCH] {text} as they happen)
+
+Output after searches finish:
+
+```
+
+[SUMMARY] (1/64558) H4513-077-3 → Summary_of_Benefits=NOT FOUND, Evidence_of_Coverage=NOT FOUND, Drug_Formulary=NOT FOUND
+[INFO] (2/64558) Searching PDFs for H4513-045-0 Cigna Courage Medicare (HMO)
+```
+
+
+
+We're not getting desired behavior, and have had the same problem for multiple cycles now.  Reflect on this.  
