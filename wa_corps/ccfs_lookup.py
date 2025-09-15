@@ -154,9 +154,6 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         # Most recent = first row
         download_icon = fulfilled[0].find_element(By.CSS_SELECTOR, "i.fa-file-text-o")
 
-        # Don't worry about the expected filename; we're just gonna static sleep and grab the newest PDF in ~/Downloads every time.
-        # Note: if multiple downloads happen in parallel, this could grab the wrong one. So don't do that.
-
         # mark a threshold BEFORE clicking
         threshold = time.time()
         print(f"[DEBUG] Threshold time before download click: {threshold}")
@@ -172,21 +169,26 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
             driver.execute_script("arguments[0].click();", download_icon)
             time.sleep(2.0)
 
-        # Wait for Download to finish (generally <1sec) 
-        # We wait a fixed 5 sec here to ensure the file is fully written without needing to poll for .part
-        # and also to avoid racing with Browser's renaming of the file after download completes.
+        # Wait for Download to finish (generally <1sec, so we're waiting a static 5 sec to keep it simple)
         time.sleep(5)
         print(f"[INFO] Waited 5 sec for download to finish for {ubi}")
-        # I'm still getting [WARN] Timed out waiting for annual report PDF for some reason, so there must be something wrong with
-        # how we grab the newest PDF in Downloads below.
 
         # Prepare output dir
         ubi_pdf_dir = BUSINESS_PDF_DIR / ubi.replace(" ", "")
         ubi_pdf_dir.mkdir(parents=True, exist_ok=True)
         target = ubi_pdf_dir / "annual_report.pdf"
 
-        # Poll for PDF in ~/Downloads
-        downloads = Path.home() / "Downloads"
+        # Poll for PDF in the ephemeral profile's ~/Downloads folder
+        # query the ephemeral profile for it's downloads folder
+        profile_dir = Path(driver.capabilities['moz:profile'])
+        downloads_dir = profile_dir / "downloads"
+        
+        # We could set Firefox profile so the PDF goes straight 
+        # into wa_corps/business_pdf/{UBI} without ever touching ~/Downloads,
+        # which would avoid this whole polling loop.
+        # but for now we want to keep using ephemeral profiles so we don't have to manage cleanup.
+        # so we query the ephemeral profile's downloads folder and use that
+        downloads = downloads_dir
         end_time = time.time() + 60
 
         # Just always grab the newest PDF
@@ -206,13 +208,6 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
             time.sleep(1)
 
         print(f"[WARN] Timed out waiting for annual report PDF for {ubi}")
-        # 👉 If you still see [WARN], it means your browser profile isn’t actually 
-        # writing to ~/Downloads. In that case, you’d want to set the Selenium 
-        # profile’s download.default_directory and point directly to BUSINESS_PDF_DIR.
-
-        # Want me to show you how to set Firefox profile so the PDF goes straight 
-        # into wa_corps/business_pdf/{UBI} without ever touching ~/Downloads? 
-        # That would avoid this whole polling loop.
 
     except Exception as e:
         print(f"[ERROR] Failed to save annual report for {ubi}: {e}")
@@ -389,17 +384,6 @@ def process_ubi(driver, ubi: str, index: int, total: int):
 
         # Try to capture annual report PDF
         save_latest_annual_report(driver, ubi, ubi_dir, json_data)
-        # C:\Users\240SSD\AppData\Local\Temp\ff-profile-0mtvpn18\downloads
-        # Right now Selenium is spinning up a fresh temporary Firefox profile each run. 
-        # That profile has its own downloads folder under 
-        # %TEMP%\ff-profile-XXXX\downloads, 
-        # so your Path.home() / "Downloads" check will never see the files.
-        # To fix this while continuing to use the ephemeral profile,
-        # you can query the profile path with:
-        # profile_dir = Path(driver.capabilities['moz:profile'])
-        # downloads_dir = profile_dir / "downloads"
-        # then you change your polling code to look in downloads_dir instead of Path.home() / "Downloads".
-        # downloads = Path(driver.capabilities['moz:profile']) / "downloads"
 
         # Re-save JSON (now with PDF path if found)
         out_path.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
