@@ -30,6 +30,9 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+import logging
+from logging.handlers import RotatingFileHandler
+
 # --- repo path setup (import start_driver) ---
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -54,8 +57,101 @@ BUSINESS_PDF_DIR.mkdir(parents=True, exist_ok=True)
 BASE_URL  = "https://ccfs.sos.wa.gov/"
 WAIT_TIME = 25  # generous; Angular SPA needs time
 
+# --- logging setup ---
+LOG_DIR = ROOT / "wa_corps" / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ----------------------- helpers -----------------------
+LOG_FILE = LOG_DIR / "ccfs_lookup.log"
+
+# Configure logger
+logger = logging.getLogger("ccfs")
+logger.setLevel(logging.INFO)
+
+handler = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
+formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+
+# -------------------- logging & progress tracking helpers --------------------
+
+# helper for logging to both console and file
+def dual_log(message: str, level: str = "info"):
+    """Print to console and log to file at the same time."""
+    print(message)
+    if level == "info":
+        logger.info(message)
+    elif level == "warn":
+        logger.warning(message)
+    elif level == "error":
+        logger.error(message)
+    elif level == "debug":
+        logger.debug(message)
+    else:
+        logger.info(message)
+
+# progress tracking globals
+def log_progress(ubi: str, index: int, total: int, status: str):
+    global success_count, fail_count, block_detected
+
+    now = time.time()
+    elapsed = now - start_time
+    elapsed_str = str(timedelta(seconds=int(elapsed)))
+
+    if status == "success":
+        success_count += 1
+    elif status.startswith("fail"):
+        fail_count += 1
+    elif status == "blocked":
+        block_detected = True
+
+    msg = (f"[LOG] {datetime.now().isoformat()} | "
+           f"UBI {index}/{total}: {ubi} | "
+           f"Status: {status} | "
+           f"Elapsed: {elapsed_str} | "
+           f"Success: {success_count} | Fail: {fail_count}")
+    dual_log(msg)
+
+# log summary helper
+def summarize_log(log_path: Path = LOG_FILE):
+    """
+    Parse the ccfs_lookup.log file and summarize performance.
+    """
+    if not log_path.exists():
+        print(f"[ERROR] No logfile found at {log_path}")
+        return
+
+    successes, fails, blocks = 0, 0, 0
+    first_block_idx, first_block_time = None, None
+
+    with log_path.open(encoding="utf-8") as f:
+        for line in f:
+            if "Status:" not in line:
+                continue
+            parts = line.strip().split("|")
+            if len(parts) < 4:
+                continue
+            status = parts[3].split(":")[-1].strip().lower()
+
+            if "success" in status:
+                successes += 1
+            elif "fail" in status:
+                fails += 1
+            elif "blocked" in status:
+                blocks += 1
+                if first_block_idx is None:
+                    first_block_idx = successes + fails
+                    first_block_time = parts[0]
+
+    dual_log("==== SUMMARY ====", "info")
+    dual_log(f"Total successes: {successes}", "info")
+    dual_log(f"Total fails: {fails}", "info")
+    dual_log(f"Total blocked: {blocks}", "info")
+    if first_block_idx:
+        dual_log(f"First block after {first_block_idx} requests at {first_block_time}", "warn")
+    dual_log("=================", "info")
+
+# ----------------------- HTML parsing helpers -----------------------
 
 def save_html(path: Path, content: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,7 +226,7 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         rows = driver.find_elements(By.CSS_SELECTOR, "table.table.table-responsive tbody tr")
         annual_report_rows = [r for r in rows if "ANNUAL REPORT" in r.text.upper()]
         if not annual_report_rows:
-            print(f"[INFO] No Annual Report rows found for {ubi}")
+            print(f"[WARN] No Annual Report rows found for {ubi}")
             return
 
         # The first row is the most recent
@@ -148,7 +244,7 @@ def save_latest_annual_report(driver, ubi: str, ubi_dir: Path, json_data: dict):
         doc_rows = modal.find_elements(By.CSS_SELECTOR, "tbody tr")
         fulfilled = [r for r in doc_rows if "ANNUAL REPORT - FULFILLED" in r.text.upper()]
         if not fulfilled:
-            print(f"[INFO] No fulfilled Annual Report found in modal for {ubi}")
+            print(f"[WARN] No fulfilled Annual Report found in modal for {ubi}")
             return
 
         # Most recent = first row
@@ -436,3 +532,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    summarize_log()

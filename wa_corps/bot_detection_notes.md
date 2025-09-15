@@ -1,0 +1,448 @@
+Ahh, yes — this is classic CCFS “bot protection” behavior, and the console output you’re seeing confirms it.
+
+Here’s what’s happening:
+
+* The **“View Documents”** click in the Filing History triggers an **XHR request** from the AngularJS SPA to their API endpoint:
+
+  ```
+  https://ccfs-api.prod.sos.wa.gov/api/Common/GetTransactionDocumentsList
+  ```
+* When browsing normally, this succeeds because the session/cookies/headers are consistent.
+* Under Selenium automation, after a few requests, the server flips a switch: the API starts returning **CORS errors / null responses**, which are surfaced in the SPA as `Cannot read properties of null (reading 'Message')`.
+* The network error (`No 'Access-Control-Allow-Origin' header`) is a *red herring*: this isn’t really a CORS misconfig, it’s the API rejecting your automated session.
+
+So yes — you’ve hit their **anti-bot detection**.
+
+---
+
+### What you can do about it
+
+#### 1. Make Selenium stealthier
+
+* Use [selenium-stealth](https://github.com/diprajpatra/selenium-stealth) or undetected-chromedriver (but you’re using Firefox, so selenium-stealth is more relevant).
+* These patch webdriver fingerprints: `navigator.webdriver`, Chrome/Firefox extension leaks, user-agent hints, etc.
+
+#### 2. Slow down & randomize
+
+* Add **random sleep intervals** between actions.
+* Rotate through different action paths (sometimes click Back, sometimes navigate home, etc).
+* This reduces your “bot-like” rhythm.
+
+#### 3. Preserve cookies & headers
+
+* Right now, every CCFS API call is done via the SPA. If CCFS starts flagging you, you can:
+
+  * Export the **auth cookies** and **XSRF token** from Selenium.
+  * Re-run the exact API request with `requests` (bypassing the SPA).
+  * That way you don’t rely on AngularJS firing an XHR.
+
+#### 4. Handle the “null Message” gracefully
+
+* When the modal fails because of the blocked API call, the UI will show nothing.
+* You could detect this case, log the UBI as “blocked”, and retry later with a fresh browser profile.
+
+#### 5. Rotate browser profiles / IPs
+
+* CCFS may be watching IP addresses. If you’re running thousands of UBIs in one go from a single IP, eventually they’ll flag you.
+* Running multiple smaller batches, or routing some requests through a residential proxy, can extend your run.
+
+---
+
+### Pragmatic recommendation
+
+Since you already have the workflow working for the **first few UBIs**, the simplest next step is:
+
+* **Batch smaller runs**: e.g. process 50 UBIs per Firefox profile, then restart.
+* **Randomize sleeps** between 1–7 seconds for each click, not fixed `time.sleep(2)`.
+* Add stealth with selenium-stealth (patch `navigator.webdriver`, etc).
+
+That alone usually bypasses this “CORS null response” style block.
+
+---
+
+👉 Question for you: do you want me to **add retry logic inside `save_latest_annual_report`** so that if the modal fails (blocked), the script kills the browser, restarts a fresh profile, and resumes from the same UBI? That would make it resilient to these detections.
+
+-------------------------------------------------------------------------------
+
+I think it's just regular rate limiting, not bot detection.  I'll link the documentation pages I got by clicking through the network requests:
+1:
+```
+Error 1015 Ray ID: 97fa64a67be0c4dd • 2025-09-15 19:05:01 UTC
+You are being rate limited
+What happened?
+The owner of this website (ccfs-api.prod.sos.wa.gov) has banned you temporarily from accessing this website.
+
+Please see https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1015/ for more details.
+
+Was this page helpful? Yes No
+Cloudflare Ray ID: 97fa64a67be0c4dd • Your IP: Click to reveal • Performance & security by Cloudflare
+```
+2: https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1015/
+3: https://developers.cloudflare.com/waf/reference/legacy/old-rate-limiting/
+
+
+It looks like the last sucessful PDF save before being rate limited was number 104/721607; can we try to reverse engineer what the maximum allowable rate is?  Maybe rotate the IP?  I'm on a residential internet connection
+
+-------------------------------------------------------------------------------
+
+Got it — thank you for catching that and pulling the Cloudflare error page. That makes it much clearer:
+
+You’re not bot-flagged per se, you’re hitting **Cloudflare’s Error 1015 “rate limited”**. That means CCFS’s API (behind Cloudflare) is configured with a hard throttle on requests per IP, not just Selenium.
+
+---
+
+### What we know from your run
+
+* You got **\~104 filings** successfully processed before the ban hit.
+* That strongly suggests they allow **a fixed number of requests per time window** (per IP).
+* The fact it took until UBI #104 means you can squeeze a decent amount through before being cut.
+
+---
+
+### Reverse engineering the throttle
+
+Cloudflare’s legacy rate-limiting (see your docs link #3) typically enforces:
+
+* **X requests per Y seconds per IP** (common thresholds are 60/minute, 100/5min, or 1000/hour).
+* Once the threshold is exceeded, your IP is temporarily banned (cool-off: often 5–15 minutes).
+
+If you got \~104 requests before a block:
+
+* It could be **100 requests / 5 minutes** (classic).
+* Or **100 requests / 10 minutes**.
+* Hard to be exact without timing how long those 104 requests took.
+
+---
+
+### What you can do about it
+
+1. **Throttle yourself**
+
+   * Insert delays to stay under \~10–12 filings/minute (≈1 every 5–6s).
+   * That should keep you under Cloudflare’s 100/5min or 100/10min rule.
+   * Better to run slower than to get cut off and lose continuity.
+
+2. **Batch runs with cooldowns**
+
+   * Do 90–95 filings, then `sleep(600)` (10min).
+   * Resume where you left off.
+   * This avoids tripping the ban hammer while still running steadily.
+
+3. **IP rotation**
+
+   * With a single residential IP, you’ll always hit the wall eventually.
+   * Options:
+
+     * Tailscale exit nodes (switch between locations).
+     * A second ISP line / mobile hotspot for alternating IPs.
+     * Residential proxy service if you want to go industrial.
+
+4. **Parallelization with multiple IPs**
+
+   * Split UBIs across IPs.
+   * E.g., if you have 3 IPs, each can do \~100 filings per cycle, for \~300 filings before hitting Cloudflare.
+   * Much more scalable.
+
+---
+
+### Recommended approach for your case
+
+Since you’re on **residential internet** (single IP), the most reliable path is:
+
+* **Throttle to 1 UBI every \~7 seconds** (≈8/min).
+* That’s \~480 per hour, \~5k per day, without hitting the 100/5min threshold.
+* Add `--start_n / --stop_n` splits and let it churn in the background.
+
+If you need faster throughput, you’ll have to introduce **IP rotation**. A cheap trick is tethering a phone hotspot for the second batch, or using a VPN with residential exit.
+
+---
+
+⚡ Question for you: do you want me to **add an automatic rate-limit manager** into `ccfs_lookup.py` (something like “after every 80 filings, sleep 10 minutes”)? That way you won’t need to babysit runs or guess the safe speed.
+
+-------------------------------------------------------------------------------
+
+I'm not sure that the threshold is 100/5min, but I would like to start measuring the runtime of the script and counting the number of sucessful requests before they start habitually failing to determine what the threshold is.
+
+Can you add detailed logging that we could use to detemine thresholds for powering the automatic rate-limit manager?
+
+-------------------------------------------------------------------------------
+
+Perfect — that’s exactly the right next step: **instrumentation before automation**. We’ll add **detailed timing + counters** into `ccfs_lookup.py` so we can see:
+
+* When each UBI starts and ends.
+* How long the request took.
+* How many have succeeded vs failed.
+* Rolling request rate (per minute, per 5 minutes, etc.).
+* First sign of “blocked” (timeouts, missing docs, etc.).
+
+That log will let us empirically see the “cliff” where Cloudflare kicks in.
+
+---
+
+Here’s a refactor you can drop into your script (logging + counters):
+
+```python
+import time
+from datetime import datetime, timedelta
+
+# Global counters
+success_count = 0
+fail_count = 0
+start_time = time.time()
+block_detected = False
+
+def log_progress(ubi: str, index: int, total: int, status: str):
+    """
+    Log a standardized line for each UBI with timing + status.
+    """
+    global success_count, fail_count, block_detected
+
+    now = time.time()
+    elapsed = now - start_time
+    elapsed_str = str(timedelta(seconds=int(elapsed)))
+
+    if status == "success":
+        success_count += 1
+    elif status == "fail":
+        fail_count += 1
+    elif status == "blocked":
+        block_detected = True
+
+    print(
+        f"[LOG] {datetime.now().isoformat()} | "
+        f"UBI {index}/{total}: {ubi} | "
+        f"Status: {status} | "
+        f"Elapsed: {elapsed_str} | "
+        f"Success: {success_count} | Fail: {fail_count}"
+    )
+
+def process_ubi(driver, ubi: str, index: int, total: int):
+    global block_detected
+    ubi_clean = ubi.replace(" ", "")
+    ubi_dir = HTML_CAPTURE_DIR / ubi_clean
+
+    start = time.time()
+    print(f"[INFO] Processing UBI {index}/{total}: {ubi}")
+
+    try:
+        # ... your normal navigation + save logic ...
+
+        # If everything works:
+        log_progress(ubi, index, total, "success")
+
+    except TimeoutException:
+        log_progress(ubi, index, total, "fail")
+        # if this is likely a rate-limit symptom:
+        if "ccfs-api.prod.sos.wa.gov" in driver.page_source or "rate limited" in driver.page_source.lower():
+            log_progress(ubi, index, total, "blocked")
+    except Exception as e:
+        log_progress(ubi, index, total, f"fail ({type(e).__name__})")
+    finally:
+        duration = time.time() - start
+        print(f"[DEBUG] UBI {ubi} took {duration:.2f} sec")
+```
+
+---
+
+### What this gives you
+
+Every processed UBI will output something like:
+
+```
+[INFO] Processing UBI 104/721607: 604 598 424
+[LOG] 2025-09-15T13:08:45 | UBI 104/721607: 604 598 424 | Status: success | Elapsed: 0:17:32 | Success: 104 | Fail: 0
+[DEBUG] UBI 604598424 took 7.23 sec
+```
+
+If a block happens:
+
+```
+[LOG] 2025-09-15T13:09:10 | UBI 105/721607: 605 516 993 | Status: blocked | Elapsed: 0:17:57 | Success: 104 | Fail: 1
+```
+
+---
+
+### Next Step
+
+Once you run a batch and collect logs, we can:
+
+* Count **how many successes before first “blocked”**.
+* Measure **avg time per UBI**.
+* Derive **max sustainable throughput**.
+* Then bake those values into an **automatic rate-limit manager** (auto-throttle / sleep cycles).
+
+---
+
+👉 Do you want me to also write a **log summarizer** (e.g., a Python function that parses these logs after the run and reports thresholds) so you don’t have to eyeball it?
+
+-------------------------------------------------------------------------------
+
+Yes, and implement it into a logfile with logger.  Keep all the print statements for easy viewing, so print output is both written in the console and saved in the logger.  I like to do this by just having 2 function calls everywhere I print; one for print(), and another for logger.log()
+
+Keep in mind that our webdriver isn't navigating to the blocked page--that's just a network request from clicking the "View Documents" button, and when it fails we see output in the devtools browser console and network tab, but the actual DOM html doesn't update.
+
+-------------------------------------------------------------------------------
+
+Got it ✅ — we’ll build this so that **all prints also get logged** (to a rotating logfile in `wa_corps/logs/ccfs_lookup.log`).
+We’ll also add a **log summarizer** to parse that logfile after a run and calculate thresholds (success rate, failures before block, runtime per UBI, etc.).
+
+---
+
+### Step 1. Setup logger
+
+At the top of `ccfs_lookup.py`:
+
+```python
+import logging
+from logging.handlers import RotatingFileHandler
+
+LOG_DIR = ROOT / "wa_corps" / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_FILE = LOG_DIR / "ccfs_lookup.log"
+
+# Configure logger
+logger = logging.getLogger("ccfs")
+logger.setLevel(logging.INFO)
+
+handler = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=3, encoding="utf-8")
+formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+```
+
+---
+
+### Step 2. Dual print+log helper
+
+```python
+def dual_log(message: str, level: str = "info"):
+    """Print to console and log to file at the same time."""
+    print(message)
+    if level == "info":
+        logger.info(message)
+    elif level == "warn":
+        logger.warning(message)
+    elif level == "error":
+        logger.error(message)
+    elif level == "debug":
+        logger.debug(message)
+    else:
+        logger.info(message)
+```
+
+Replace every `print()` and `log_progress()` call with `dual_log(...)`.
+
+Example:
+
+```python
+dual_log(f"[INFO] Processing UBI {index}/{total}: {ubi}")
+```
+
+---
+
+### Step 3. Enhanced log\_progress
+
+```python
+def log_progress(ubi: str, index: int, total: int, status: str):
+    global success_count, fail_count, block_detected
+
+    now = time.time()
+    elapsed = now - start_time
+    elapsed_str = str(timedelta(seconds=int(elapsed)))
+
+    if status == "success":
+        success_count += 1
+    elif status.startswith("fail"):
+        fail_count += 1
+    elif status == "blocked":
+        block_detected = True
+
+    msg = (f"[LOG] {datetime.now().isoformat()} | "
+           f"UBI {index}/{total}: {ubi} | "
+           f"Status: {status} | "
+           f"Elapsed: {elapsed_str} | "
+           f"Success: {success_count} | Fail: {fail_count}")
+    dual_log(msg)
+```
+
+---
+
+### Step 4. Add log summarizer
+
+Put this at the bottom of the file (or in `utils/summary.py` if you prefer):
+
+```python
+def summarize_log(log_path: Path = LOG_FILE):
+    """
+    Parse the ccfs_lookup.log file and summarize performance.
+    """
+    if not log_path.exists():
+        print(f"[ERROR] No logfile found at {log_path}")
+        return
+
+    successes, fails, blocks = 0, 0, 0
+    first_block_idx, first_block_time = None, None
+
+    with log_path.open(encoding="utf-8") as f:
+        for line in f:
+            if "Status:" not in line:
+                continue
+            parts = line.strip().split("|")
+            if len(parts) < 4:
+                continue
+            status = parts[3].split(":")[-1].strip().lower()
+
+            if "success" in status:
+                successes += 1
+            elif "fail" in status:
+                fails += 1
+            elif "blocked" in status:
+                blocks += 1
+                if first_block_idx is None:
+                    first_block_idx = successes + fails
+                    first_block_time = parts[0]
+
+    dual_log("==== SUMMARY ====", "info")
+    dual_log(f"Total successes: {successes}", "info")
+    dual_log(f"Total fails: {fails}", "info")
+    dual_log(f"Total blocked: {blocks}", "info")
+    if first_block_idx:
+        dual_log(f"First block after {first_block_idx} requests at {first_block_time}", "warn")
+    dual_log("=================", "info")
+```
+
+You can call it after the main run:
+
+```python
+if __name__ == "__main__":
+    main()
+    summarize_log()
+```
+
+---
+
+### Key Notes
+
+* Since the block is only visible in **network/XHR** failures, not the DOM, the best way to detect it is by logging **when no fulfilled documents are found** after a successful filing-row click. We’ll log that as `"blocked?"` instead of `"fail"`.
+* With this logging, you’ll be able to see exactly **after how many successes** the first failures/blocks start showing up.
+
+---
+
+Would you like me to also add an **incremental sleep throttle** (e.g. exponential backoff if too many consecutive `"blocked?"`) — or do you prefer to **just measure cleanly first** with no slowdown so we can find the true ceiling?
+
+-------------------------------------------------------------------------------
+
+I'd like just clean measurements first, and auto-exit main once 5 PDFs in a row fail, so that we can call summarize_log() and get some measurements.  Implement measurement logging across multiple runs in a separate file.
+
+-------------------------------------------------------------------------------
+
+
+-------------------------------------------------------------------------------
+
+
+-------------------------------------------------------------------------------
+
+
+-------------------------------------------------------------------------------
+
