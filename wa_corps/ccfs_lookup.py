@@ -352,99 +352,12 @@ def process_ubi(driver, ubi: str, index: int, total: int):
         out_path.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
         print(f"[INFO] Saved JSON → {out_path}")
 
-        # Click "Filing History" button: <input type="button" id="btnFilingHistory" class="btn btn-success" value="Filing History" ng-click="navBusinessFilings()">
-        # Args:
-        #     driver: Selenium WebDriver instance
-        #     by: locator type, e.g., By.CSS_SELECTOR
-        #     selector: element selector string
-        #     action: "click" (default) or "send_keys"
-        #     keys: text to send if action="send_keys"
-        #     timeout: max seconds to wait for element
-        #     settle_delay: pause after scrolling (for animations)
-        _safe_click_element(driver, driver.find_element(By.ID, "btnFilingHistory"), settle_delay=2)
-        time.sleep(2.0)  # let Angular finish
+        # Try to capture annual report PDF
+        save_latest_annual_report(driver, ubi, ubi_dir, json_data)
 
-        # Scan the business filing table: 
-        # #divBusinessInformation > div:nth-child(4) > div.row-margin > div > div > table > tbody:nth-child(3)
-        # 
-        # for the first "Annual Report" rowand click the "View Documents" link in that row to open the modal: 
-        # <tr ng-repeat="filing in businessFilings| orderBy:propertyName:reverse" class="ng-scope" style="">
-        #     <td class="ng-binding">0021617353</td>
-        #     <td class="ng-binding">02/01/2025 07:27:41 AM</td>
+        # Re-save JSON (now with PDF path if found)
+        out_path.write_text(json.dumps(json_data, indent=2), encoding="utf-8")
 
-        #     <td class="ng-binding">02/01/2025</td>
-        #     <!--<td>{{filing.ProcessedBy | uppercase}}</td>-->
-        #     <td ng-bind="filing.FilingTypeName" class="ng-binding">ANNUAL REPORT</td>
-        #     <!--<td ng-if="filing.DocumentId > 0">
-        #         <i class="fa fa-file-text-o fa-lg" style="cursor:pointer" filename="filing.FileName" params="filing" url="Common/DownloadFileByNumber?filingNo={{filing.FilingNumber}}" title="Download" download-file ng-bind="filing.FilingTypeName">
-        #             <span ng-bind="filing.FilingTypeName"></span>
-        #         </i>
-        #     </td>-->
-        #     <td>
-        #         <a class="btn-link" style="cursor:pointer" ng-click="getTransactionDocumentsList(filing.FilingNumber,filing.Transactionid,filing.FilingTypeName)">View Documents</a>
-        #     </td>
-        #     <!--<td ng-if="filing.DocumentId == 0"></td>-->
-        # </tr>
-        # 
-        #
-        # Then, in the modal, find the PDF link for the "ANNUAL REPORT - FULFILLED" and download it
-        # Modal with table inside of it: 
-        # 
-        # <div class="modal-dialog" style="width:80%;">
-        #     <div class="modal-content">
-        #         <div class="modal-header">
-        #             ...
-        #         </div>
-        #         <div class="searchresult modal-body" style="max-height:600px;overflow-y:auto;">
-        #             <div class="row table-responsive table-striped">
-        #                 <table style="width:100%" border="0" cellpadding="4" cellspacing="0" class="table table-responsive table-striped">
-        #                     <thead>
-        #                         <tr align="center" class="bg-primary text-center">
-        #                             <!--<th>File Name</th>-->
-        #                             <th>Document Type</th>
-        #                             <!--<th>Created By</th>-->
-        #                             <th>Created Date</th>
-        #                             <th>Action</th>
-        #                         </tr>
-        #                     </thead>
-        #                     <!-- ngRepeat: document in transactionDocumentsList --><!-- ngIf: document.DocumentTypeID!=2 --><tbody data-ng-repeat="document in transactionDocumentsList" data-ng-if="document.DocumentTypeID!=2" class="ng-scope" style="">
-        #                         <tr align="left" class="bgwhite">
-        #                             <!--<td><span data-ng-bind="document.CorrespondenceFileName"></span></td>-->
-        #                             <td><span data-ng-bind="document.DocumentTypeName" class="ng-binding">ANNUAL REPORT - FULFILLED</span></td>
-        #                             <!--<td><span data-ng-bind="document.UserName"></span></td>-->
-        #                             <td><span data-ng-bind="document.FilingDateTime | date:'MM/dd/yyyy'" class="ng-binding">02/01/2025</span></td>
-        #                             <td>
-        #                                 <i class="fa fa-file-text-o fa-lg ng-binding ng-isolate-scope ng-scope" style="cursor:pointer" filename="document.CorrespondenceFileName" params="document" url="Common/DownloadOnlineFilesByNumber?fileName=&amp;CorrespondenceFileName=&amp;DocumentTypeId=" title="Download/Print" download-file="" ng-bind="document.CorrespondenceFileName" ng-click="downloadPdf()"></i>
-        #                             </td>
-        #                         </tr>
-        #                     ...
-        #                     <tbody data-ng-hide="transactionDocumentsList.length&gt;0" class="ng-hide" style="">
-        #                         <tr><td colspan="5" ng-bind="messages.RegisteredAgent.emptyRecordsMsg" class="ng-binding">No Value Found.</td></tr>
-        #                     </tbody>
-        #                 </table>
-        #             </div>
-        #         </div>
-        #     </div>
-        # </div>
-        #
-        # table row of interest:
-        # <tr align="left" class="bgwhite">
-        #     <!--<td><span data-ng-bind="document.CorrespondenceFileName"></span></td>-->
-        #     <td><span data-ng-bind="document.DocumentTypeName" class="ng-binding">ANNUAL REPORT - FULFILLED</span></td>
-        #     <!--<td><span data-ng-bind="document.UserName"></span></td>-->
-        #     <td><span data-ng-bind="document.FilingDateTime | date:'MM/dd/yyyy'" class="ng-binding">02/01/2025</span></td>
-        #     <td>
-        #         <i class="fa fa-file-text-o fa-lg ng-binding ng-isolate-scope ng-scope" style="cursor:pointer" filename="document.CorrespondenceFileName" params="document" url="Common/DownloadOnlineFilesByNumber?fileName=&amp;CorrespondenceFileName=&amp;DocumentTypeId=" title="Download/Print" download-file="" ng-bind="document.CorrespondenceFileName" ng-click="downloadPdf()"></i>
-        #     </td>
-        # </tr>
-        #
-        # download button: <i class="fa fa-file-text-o fa-lg ng-binding ng-isolate-scope ng-scope" style="cursor:pointer" filename="document.CorrespondenceFileName" params="document" url="Common/DownloadOnlineFilesByNumber?fileName=&amp;CorrespondenceFileName=&amp;DocumentTypeId=" title="Download/Print" download-file="" ng-bind="document.CorrespondenceFileName" ng-click="downloadPdf()"></i>
-        # save the PDF to wa_corps/business_pdf/{UBI}/annual_report.pdf
-        # and record the path in the JSON output under "capture_paths.annual_report_pdf"
-        # Note: there may be multiple "ANNUAL REPORT - FULFILLED" entries; we want the most recent one (top of table)
-        # Note: there may be no "ANNUAL REPORT - FULFILLED" entry at all
-        # Finally, navigate back to the home page for the next UBI
-        # (we could also try to click a "Back" button, but this is more robust)
     except TimeoutException:
         print(f"[ERROR] Timeout for UBI {ubi}")
     except Exception as e:
