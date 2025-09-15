@@ -20,6 +20,7 @@ import json
 import time
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta
 
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import (
@@ -579,9 +580,6 @@ def main():
 
     dual_log(f"[INFO] Measurements appended to {MEASUREMENTS_FILE}")
     summarize_log()
-
-
-
 
 if __name__ == "__main__":
     main()
