@@ -1066,9 +1066,243 @@ Do you want me to also add a **CSV plotter** (matplotlib quick chart of successe
 
 -------------------------------------------------------------------------------
 
+Thanks for pasting that long run log — it confirms the cooldown logic isn’t enough. Here’s what’s happening:
+
+* You’re hitting the API “modal not displayed” block consistently after \~20–25 UBIs (≈ 7–8 minutes of runtime).
+* Even after a **900s (15 min) cooldown**, the block persists (batches #2 and #3 are 100% blocked).
+* This suggests Cloudflare’s **rate-limit window is longer than your cooldown** — likely **30–60 min**, not 5–15.
+
+---
+
+## Adjustments I recommend
+
+### 1. Exponential backoff cooldown
+
+Instead of a fixed 900s:
+
+```python
+cooldown = base_cooldown * (2 ** consecutive_block_batches)
+cooldown = min(cooldown, MAX_COOLDOWN)  # cap at e.g. 1 hour
+```
+
+* First block batch → wait 15m
+* Second block batch → wait 30m
+* Third → wait 1h
+* Then cap.
+
+This lets you “probe” until the block actually clears.
+
+---
+
+### 2. Batch-level slowdown before blocking
+
+We can self-throttle **before** Cloudflare blocks us:
+
+* Insert a small random sleep (e.g. 10–20s) between each UBI.
+* Measure average throughput per batch; if successes < threshold (say 70%), automatically stretch inter-request delay by +5s per UBI.
+
+---
+
+### 3. Record per-batch block persistence
+
+Add to your batch CSV:
+
+* `block_persisted=1` if *all* UBIs in batch failed as blocked.
+  That way we can measure how many cooldown cycles are wasted.
+
+---
+
+### 4. Optional: human-in-the-loop resume
+
+Sometimes Cloudflare bans your **IP for hours**. In that case, automation alone won’t recover quickly. Best fallback:
+
+* Auto-exit after N consecutive block-only batches.
+* Summarize & suggest waiting longer / switching IP.
+
+---
+
+## Example Snippet (drop-in)
+
+```python
+# in main loop after each batch
+if block_count > 0:
+    consecutive_block_batches += 1
+    cooldown = BASE_COOLDOWN * (2 ** (consecutive_block_batches - 1))
+    cooldown = min(cooldown, MAX_COOLDOWN)
+    dual_log(f"[WARN] Batch #{batch_id} had blocks. Cooling {cooldown//60} minutes.")
+    time.sleep(cooldown)
+else:
+    consecutive_block_batches = 0
+    cooldown = BASE_COOLDOWN  # reset
+```
+
+---
+
+📊 With your logs, I’d suggest:
+
+* `BASE_COOLDOWN = 900` (15m)
+* `MAX_COOLDOWN = 3600` (1h)
+* Add **10s jitter** between requests inside each batch.
+
+---
+
+Do you want me to **patch your current `main()`** with this exponential cooldown + inter-request jitter, so you can test on the next run?
 
 -------------------------------------------------------------------------------
 
+Got it — thanks for pasting the current `main()`. I’ll patch **just the batch/cooldown logic** to add:
+
+1. **Exponential backoff** for block-driven cooldowns (`15m → 30m → 1h`).
+2. **Random inter-UBI jitter** (5–15s sleep) to smooth traffic.
+3. Preserve all existing features: measurement logging, batch summaries, early exit rules, etc.
+
+Here’s a safe drop-in replacement for your `main()`:
+
+```python
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start_n", type=int, default=1)
+    parser.add_argument("--stop_n", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=30,
+                        help="Number of UBIs to process before cooldown")
+    parser.add_argument("--cooldown", type=int, default=90,
+                        help="Base cooldown seconds between batches (adaptive if blocked)")
+    args = parser.parse_args()
+
+    global start_time, success_count, fail_count, block_detected, block_count, first_block_at_index
+    start_time = time.time()
+    success_count = 0
+    fail_count = 0
+    block_detected = False
+    block_count = 0
+    first_block_at_index = None
+
+    if not INPUT_CSV.exists():
+        print(f"[ERROR] Input CSV not found: {INPUT_CSV}")
+        sys.exit(1)
+
+    # Read all UBIs
+    with INPUT_CSV.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        ubis = [row["UBI#"].strip() for row in reader if row.get("UBI#")]
+
+    total = len(ubis)
+    if total == 0:
+        print("[ERROR] No UBIs found in input CSV")
+        sys.exit(1)
+
+    start_n = max(1, args.start_n)
+    stop_n = args.stop_n if args.stop_n is not None else total
+    if start_n > total:
+        print(f"[ERROR] start_n {start_n} > total {total}")
+        sys.exit(1)
+    stop_n = min(stop_n, total)
+
+    slice_ubis = ubis[start_n - 1: stop_n]
+    print(f"[INFO] Loaded {total} UBIs, processing {len(slice_ubis)} (rows {start_n}..{stop_n})")
+
+    # Adaptive cooldown state
+    base_cooldown = args.cooldown
+    max_cooldown = 3600  # cap at 1h
+    consecutive_block_batches = 0
+
+    with start_driver() as driver:
+        driver.get(BASE_URL)
+        consecutive_failures = 0
+        batch_count = 0
+        batch_id = 0
+        batch_start_idx = start_n
+        batch_success, batch_fail, batch_block = 0, 0, 0
+        batch_start_time = time.time()
+
+        for i, ubi in enumerate(slice_ubis, start=start_n):
+            # --- per-UBI jitter to avoid bursts ---
+            jitter = random.randint(5, 15)
+            time.sleep(jitter)
+
+            status = process_ubi(driver, ubi, i, total)
+            log_progress(ubi, i, total, status)
+
+            if status.lower().startswith("success"):
+                consecutive_failures = 0
+                batch_success += 1
+            elif status.lower().startswith("fail"):
+                consecutive_failures += 1
+                batch_fail += 1
+            elif status.lower().startswith("blocked"):
+                consecutive_failures += 1
+                batch_block += 1
+            else:
+                consecutive_failures = 0
+
+            batch_count += 1
+
+            # --- forced cooldown on consecutive failures ---
+            if consecutive_failures >= 5:
+                batch_id += 1
+                elapsed = int(time.time() - batch_start_time)
+                # exponential cooldown for blocks
+                consecutive_block_batches += 1
+                cooldown = min(base_cooldown * (2 ** (consecutive_block_batches - 1)), max_cooldown)
+                log_batch(batch_id, batch_start_idx, i,
+                          batch_success, batch_fail, batch_block, elapsed, cooldown)
+                dual_log(f"[WARN] Hit {consecutive_failures} consecutive failures. Cooling {cooldown}s (exp backoff).")
+                time.sleep(cooldown)
+                # reset batch
+                batch_start_idx = i + 1
+                batch_start_time = time.time()
+                batch_success, batch_fail, batch_block = 0, 0, 0
+                consecutive_failures = 0
+                batch_count = 0
+                continue  # move on to next UBI
+
+            # --- regular batch cooldown ---
+            if batch_count >= args.batch_size:
+                batch_id += 1
+                elapsed = int(time.time() - batch_start_time)
+
+                if batch_block > 0:
+                    consecutive_block_batches += 1
+                    cooldown = min(base_cooldown * (2 ** (consecutive_block_batches - 1)), max_cooldown)
+                    dual_log(f"[WARN] Batch #{batch_id} had {batch_block} blocks. Cooling {cooldown}s (exp backoff).")
+                else:
+                    consecutive_block_batches = 0
+                    cooldown = base_cooldown
+                    dual_log(f"[INFO] Completed batch of {batch_count} UBIs. Cooling {cooldown}s.")
+
+                log_batch(batch_id, batch_start_idx, i,
+                          batch_success, batch_fail, batch_block, elapsed, cooldown)
+
+                time.sleep(cooldown)
+                # reset batch
+                batch_start_idx = i + 1
+                batch_start_time = time.time()
+                batch_success, batch_fail, batch_block = 0, 0, 0
+                batch_count = 0
+
+    # After all done, append measurements
+    end_time = time.time()
+    elapsed_sec = int(end_time - start_time)
+
+    with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
+        f.write(
+            f"{datetime.now().isoformat()},"
+            f"{len(slice_ubis)},{success_count},{fail_count},{block_count},"
+            f"{elapsed_sec},{first_block_at_index or ''}\n"
+        )
+
+    dual_log(f"[INFO] Measurements appended to {MEASUREMENTS_FILE}")
+    summarize_log()
+    summarize_batches()
+```
+
+---
+
+✅ All existing features preserved.
+➕ Adds jitter + exponential cooldown for blocked batches.
+➕ Keeps per-batch metrics intact.
+
+Do you want me to also make the **cooldown strategy visible in the measurements CSV** (extra columns for `cooldown_used` per batch)?
 
 -------------------------------------------------------------------------------
 
