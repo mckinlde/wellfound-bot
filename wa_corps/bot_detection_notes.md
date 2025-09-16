@@ -703,6 +703,372 @@ Shout if you want me to fold in a small guard so `first_block_idx` is derived mo
 
 -------------------------------------------------------------------------------
 
+Here's the summary:
+
+INFO:ccfs:[INFO] Measurements appended to C:\Users\240SSD\git repos\wellfound-bot\wa_corps\logs\ccfs_measurements.csv
+==== SUMMARY ====
+INFO:ccfs:==== SUMMARY ====
+Total successes: 51
+INFO:ccfs:Total successes: 51
+Total fails: 26
+INFO:ccfs:Total fails: 26
+Total blocked: 6
+INFO:ccfs:Total blocked: 6
+=================
+INFO:ccfs:=================
+
+And csv:
+timestamp,total_ubis,successes,fails,blocks,elapsed_sec,first_block_idx
+2025-09-16T09:19:46.184498,721607,51,24,3,1757,76
+
+Based on this data, can you implement self-throttling / batch cooldowns?
+
+-------------------------------------------------------------------------------
+
+Got it — thanks for sharing the fresh summary + CSV. ✅
+You’re already collecting enough measurement data to implement **self-throttling** logic that will help stretch out your run without hitting Cloudflare’s rate limiter.
+
+---
+
+## Observations from your data
+
+* **51 successes** before the first hard block, then **24 fails**, then **3 blocks**【ccfs\_measurements.csv】.
+* That matches what you observed earlier: you can grab **\~50 annual reports** quickly before Cloudflare pushes back.
+* The runtime until blocking: **1757s ≈ 29 minutes** → average throughput \~1.7 UBIs/minute.
+
+This suggests the limiter is based on **number of document downloads in a rolling window** (Cloudflare Error 1015), not just raw page views.
+
+---
+
+## Throttling Strategy
+
+We want to **avoid** racking up consecutive fails/blocks. Instead:
+
+1. **Batch control**
+
+   * Group UBIs into batches (e.g. 30–40 UBIs).
+   * After each batch, pause (cooldown).
+
+2. **Adaptive cooldown**
+
+   * If consecutive fails/blocks ≥ 2 → increase cooldown (e.g. +2 min).
+   * If smooth run → keep cooldown short (e.g. 30–60 s).
+
+3. **Reset on block detection**
+
+   * If “blocked” detected, immediately pause for a long cooldown (e.g. 15 min).
+   * Then resume from where you left off.
+
+---
+
+## Example Patch for `main()`
+
+Here’s how you can wire this in without breaking existing logging:
+
+```python
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start_n", type=int, default=1)
+    parser.add_argument("--stop_n", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=40,
+                        help="Number of UBIs to process before cooldown")
+    parser.add_argument("--cooldown", type=int, default=60,
+                        help="Cooldown seconds between batches")
+    args = parser.parse_args()
+
+    # ... load UBIs same as before ...
+
+    with start_driver() as driver:
+        driver.get(BASE_URL)
+        consecutive_failures = 0
+        batch_count = 0
+
+        for i, ubi in enumerate(slice_ubis, start=start_n):
+            status = process_ubi(driver, ubi, i, total)
+            log_progress(ubi, i, total, status)
+
+            # Update counters
+            if status.lower().startswith("success"):
+                consecutive_failures = 0
+            elif status.lower().startswith("fail") or status.lower().startswith("blocked"):
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+
+            batch_count += 1
+
+            # --- adaptive cooldowns ---
+            if consecutive_failures >= 5:
+                dual_log(f"[WARN] Hit {consecutive_failures} consecutive failures. Cooling down 15m.")
+                time.sleep(15 * 60)
+                consecutive_failures = 0
+                batch_count = 0
+
+            elif batch_count >= args.batch_size:
+                dual_log(f"[INFO] Completed batch of {batch_count} UBIs. Cooling down {args.cooldown}s.")
+                time.sleep(args.cooldown)
+                batch_count = 0
+```
+
+---
+
+## How This Works
+
+* By default:
+
+  * Every 40 UBIs → pause 60s.
+  * If 5 consecutive fails/blocks → force pause 15m.
+* You can tune `--batch_size` and `--cooldown` via CLI.
+
+---
+
+## Next Step
+
+I suggest:
+
+1. Run with `--batch_size 30 --cooldown 90` first.
+2. Inspect the log/measurements to see if blocks disappear.
+3. If you still hit blocking around \~50 UBIs, increase cooldown (2–3 min) or lower batch size (20 UBIs).
+
+---
+
+Do you want me to also add **CSV metrics per batch** (like “batch start/end time, successes, fails”), so you can later chart what cooldown settings are most effective? That’d make tuning much easier.
+
+-------------------------------------------------------------------------------
+
+Perfect 👍 — let’s extend the current measurement system so you’ll get **both global run stats** *and* **per-batch metrics**.
+
+---
+
+## Design
+
+We’ll add a new CSV:
+`wa_corps/logs/ccfs_batches.csv`
+
+Each row will track:
+
+* `timestamp` – when batch ended
+* `batch_id` – sequential batch counter
+* `start_idx` / `end_idx` – UBI row indices in that batch
+* `successes` – successes in batch
+* `fails` – fails in batch
+* `blocks` – blocks in batch
+* `elapsed_sec` – runtime of batch
+* `cooldown_sec` – how long we cooled down after the batch
+
+---
+
+## Code Patch
+
+Add these near your logging helpers:
+
+```python
+BATCH_FILE = LOG_DIR / "ccfs_batches.csv"
+
+# ensure header
+if not BATCH_FILE.exists():
+    with BATCH_FILE.open("w", encoding="utf-8", newline="") as f:
+        f.write("timestamp,batch_id,start_idx,end_idx,successes,fails,blocks,elapsed_sec,cooldown_sec\n")
+
+def log_batch(batch_id, start_idx, end_idx, successes, fails, blocks, elapsed_sec, cooldown_sec):
+    """
+    Append one row of batch metrics to ccfs_batches.csv
+    """
+    with BATCH_FILE.open("a", encoding="utf-8", newline="") as f:
+        f.write(
+            f"{datetime.now().isoformat()},"
+            f"{batch_id},{start_idx},{end_idx},"
+            f"{successes},{fails},{blocks},"
+            f"{elapsed_sec},{cooldown_sec}\n"
+        )
+
+    dual_log(f"[BATCH] #{batch_id} | UBIs {start_idx}-{end_idx} | "
+             f"Succ={successes} Fail={fails} Block={blocks} | "
+             f"Elapsed={elapsed_sec}s | Cooldown={cooldown_sec}s")
+```
+
+---
+
+## Update `main()`
+
+Modify your batch loop:
+
+```python
+with start_driver() as driver:
+    driver.get(BASE_URL)
+    consecutive_failures = 0
+    batch_count = 0
+    batch_id = 0
+    batch_start_idx = start_n
+    batch_success, batch_fail, batch_block = 0, 0, 0
+    batch_start_time = time.time()
+
+    for i, ubi in enumerate(slice_ubis, start=start_n):
+        status = process_ubi(driver, ubi, i, total)
+        log_progress(ubi, i, total, status)
+
+        if status.lower().startswith("success"):
+            consecutive_failures = 0
+            batch_success += 1
+        elif status.lower().startswith("fail"):
+            consecutive_failures += 1
+            batch_fail += 1
+        elif status.lower().startswith("blocked"):
+            consecutive_failures += 1
+            batch_block += 1
+        else:
+            consecutive_failures = 0
+
+        batch_count += 1
+
+        # --- forced cooldown on consecutive failures ---
+        if consecutive_failures >= 5:
+            cooldown = 15 * 60
+            batch_id += 1
+            elapsed = int(time.time() - batch_start_time)
+            log_batch(batch_id, batch_start_idx, i, batch_success, batch_fail, batch_block, elapsed, cooldown)
+            dual_log(f"[WARN] Hit {consecutive_failures} consecutive failures. Cooling {cooldown}s.")
+            time.sleep(cooldown)
+            # reset batch
+            batch_start_idx = i + 1
+            batch_start_time = time.time()
+            batch_success, batch_fail, batch_block = 0, 0, 0
+            consecutive_failures = 0
+            batch_count = 0
+
+        # --- regular batch cooldown ---
+        elif batch_count >= args.batch_size:
+            cooldown = args.cooldown
+            batch_id += 1
+            elapsed = int(time.time() - batch_start_time)
+            log_batch(batch_id, batch_start_idx, i, batch_success, batch_fail, batch_block, elapsed, cooldown)
+            dual_log(f"[INFO] Completed batch of {batch_count} UBIs. Cooling {cooldown}s.")
+            time.sleep(cooldown)
+            # reset batch
+            batch_start_idx = i + 1
+            batch_start_time = time.time()
+            batch_success, batch_fail, batch_block = 0, 0, 0
+            batch_count = 0
+```
+
+---
+
+## Result
+
+Now you’ll have two CSVs:
+
+* `ccfs_measurements.csv` → whole-run stats (like before)
+* `ccfs_batches.csv` → per-batch breakdown, perfect for plotting block-onset trends
+
+And both still log to console + logfile for visibility.
+
+---
+
+Do you want me to also wire in a **summarize\_batches()** helper (like `summarize_log`) so you can quickly see average throughput, time to block, etc. after each run?
+
+-------------------------------------------------------------------------------
+
+Got it ✅ — let’s add a `summarize_batches()` helper that parses your new `ccfs_batches.csv` and prints per-batch averages, totals, and time-to-block info.
+
+---
+
+## Code to Add
+
+Drop this near your `summarize_log()`:
+
+```python
+def summarize_batches(batch_path: Path = BATCH_FILE):
+    """
+    Parse the ccfs_batches.csv file and summarize batch-level performance.
+    """
+    if not batch_path.exists():
+        dual_log(f"[ERROR] No batch file found at {batch_path}", "error")
+        return
+
+    total_batches = 0
+    total_success = total_fail = total_block = 0
+    total_elapsed = total_cooldown = 0
+    first_block_batch = None
+
+    with batch_path.open(encoding="utf-8") as f:
+        next(f)  # skip header
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) < 9:
+                continue
+            (
+                timestamp, batch_id, start_idx, end_idx,
+                succ, fail, block, elapsed, cooldown
+            ) = parts
+
+            batch_id = int(batch_id)
+            succ, fail, block = int(succ), int(fail), int(block)
+            elapsed, cooldown = int(elapsed), int(cooldown)
+
+            total_batches += 1
+            total_success += succ
+            total_fail += fail
+            total_block += block
+            total_elapsed += elapsed
+            total_cooldown += cooldown
+
+            if block > 0 and first_block_batch is None:
+                first_block_batch = batch_id
+
+    dual_log("==== BATCH SUMMARY ====", "info")
+    dual_log(f"Total batches: {total_batches}", "info")
+    dual_log(f"Total successes: {total_success}", "info")
+    dual_log(f"Total fails: {total_fail}", "info")
+    dual_log(f"Total blocked: {total_block}", "info")
+    dual_log(f"Avg successes/batch: {total_success // total_batches if total_batches else 0}", "info")
+    dual_log(f"Avg fails/batch: {total_fail // total_batches if total_batches else 0}", "info")
+    dual_log(f"Avg runtime/batch: {total_elapsed // total_batches if total_batches else 0}s", "info")
+    dual_log(f"Avg cooldown/batch: {total_cooldown // total_batches if total_batches else 0}s", "info")
+    if first_block_batch:
+        dual_log(f"First block occurred in batch #{first_block_batch}", "warn")
+    dual_log("======================", "info")
+```
+
+---
+
+## Where to Call
+
+At the end of `main()` (right after your existing `summarize_log()`):
+
+```python
+summarize_log()
+summarize_batches()
+```
+
+---
+
+## What You’ll See
+
+Example output after a run:
+
+```
+==== BATCH SUMMARY ====
+Total batches: 4
+Total successes: 51
+Total fails: 26
+Total blocked: 6
+Avg successes/batch: 12
+Avg fails/batch: 6
+Avg runtime/batch: 437s
+Avg cooldown/batch: 900s
+First block occurred in batch #3
+======================
+```
+
+---
+
+Do you want me to also add a **CSV plotter** (matplotlib quick chart of successes/fails/blocks per batch) so you can visualize rate-limit onset, or keep it strictly textual for now?
+
+-------------------------------------------------------------------------------
+
+
+-------------------------------------------------------------------------------
+
 
 -------------------------------------------------------------------------------
 

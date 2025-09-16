@@ -179,6 +179,85 @@ def summarize_log(log_path: Path = LOG_FILE):
         dual_log(f"First block after {first_block_idx} requests at {first_block_time}", "warn")
     dual_log("=================", "info")
 
+
+# batch summary helper
+def summarize_batches(batch_path: Path = BATCH_FILE):
+    """
+    Parse the ccfs_batches.csv file and summarize batch-level performance.
+    """
+    if not batch_path.exists():
+        dual_log(f"[ERROR] No batch file found at {batch_path}", "error")
+        return
+
+    total_batches = 0
+    total_success = total_fail = total_block = 0
+    total_elapsed = total_cooldown = 0
+    first_block_batch = None
+
+    with batch_path.open(encoding="utf-8") as f:
+        next(f)  # skip header
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) < 9:
+                continue
+            (
+                timestamp, batch_id, start_idx, end_idx,
+                succ, fail, block, elapsed, cooldown
+            ) = parts
+
+            batch_id = int(batch_id)
+            succ, fail, block = int(succ), int(fail), int(block)
+            elapsed, cooldown = int(elapsed), int(cooldown)
+
+            total_batches += 1
+            total_success += succ
+            total_fail += fail
+            total_block += block
+            total_elapsed += elapsed
+            total_cooldown += cooldown
+
+            if block > 0 and first_block_batch is None:
+                first_block_batch = batch_id
+
+    dual_log("==== BATCH SUMMARY ====", "info")
+    dual_log(f"Total batches: {total_batches}", "info")
+    dual_log(f"Total successes: {total_success}", "info")
+    dual_log(f"Total fails: {total_fail}", "info")
+    dual_log(f"Total blocked: {total_block}", "info")
+    dual_log(f"Avg successes/batch: {total_success // total_batches if total_batches else 0}", "info")
+    dual_log(f"Avg fails/batch: {total_fail // total_batches if total_batches else 0}", "info")
+    dual_log(f"Avg runtime/batch: {total_elapsed // total_batches if total_batches else 0}s", "info")
+    dual_log(f"Avg cooldown/batch: {total_cooldown // total_batches if total_batches else 0}s", "info")
+    if first_block_batch:
+        dual_log(f"First block occurred in batch #{first_block_batch}", "warn")
+    dual_log("======================", "info")
+
+
+# ----------------------- Per-Batch Logging -----------------------
+BATCH_FILE = LOG_DIR / "ccfs_batches.csv"
+
+# ensure header
+if not BATCH_FILE.exists():
+    with BATCH_FILE.open("w", encoding="utf-8", newline="") as f:
+        f.write("timestamp,batch_id,start_idx,end_idx,successes,fails,blocks,elapsed_sec,cooldown_sec\n")
+
+def log_batch(batch_id, start_idx, end_idx, successes, fails, blocks, elapsed_sec, cooldown_sec):
+    """
+    Append one row of batch metrics to ccfs_batches.csv
+    """
+    with BATCH_FILE.open("a", encoding="utf-8", newline="") as f:
+        f.write(
+            f"{datetime.now().isoformat()},"
+            f"{batch_id},{start_idx},{end_idx},"
+            f"{successes},{fails},{blocks},"
+            f"{elapsed_sec},{cooldown_sec}\n"
+        )
+
+    dual_log(f"[BATCH] #{batch_id} | UBIs {start_idx}-{end_idx} | "
+             f"Succ={successes} Fail={fails} Block={blocks} | "
+             f"Elapsed={elapsed_sec}s | Cooldown={cooldown_sec}s")
+
+
 # ----------------------- HTML parsing helpers -----------------------
 
 def save_html(path: Path, content: str) -> str:
@@ -533,18 +612,22 @@ def process_ubi(driver, ubi: str, index: int, total: int):
 # ----------------------- CLI & runner -----------------------
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start_n", type=int, default=1)
+    parser.add_argument("--stop_n", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=30,
+                        help="Number of UBIs to process before cooldown")
+    parser.add_argument("--cooldown", type=int, default=90,
+                        help="Cooldown seconds between batches")
+    args = parser.parse_args()
+
     global start_time, success_count, fail_count, block_detected, block_count, first_block_at_index
     start_time = time.time()
     success_count = 0
     fail_count = 0
     block_detected = False
-    block_count = 0                 # NEW
-    first_block_at_index = None     # NEW
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--start_n", type=int, default=1, help="Start index (1-based)")
-    parser.add_argument("--stop_n", type=int, default=None, help="Stop index (inclusive)")
-    args = parser.parse_args()
+    block_count = 0                 
+    first_block_at_index = None     
 
     if not INPUT_CSV.exists():
         print(f"[ERROR] Input CSV not found: {INPUT_CSV}")
@@ -570,26 +653,62 @@ def main():
     slice_ubis = ubis[start_n - 1: stop_n]
     print(f"[INFO] Loaded {total} UBIs, processing {len(slice_ubis)} (rows {start_n}..{stop_n})")
 
-    # Single stable session
+    
     with start_driver() as driver:
-        # Ensure we load home once up-front (also prompts any CF/js to settle)
         driver.get(BASE_URL)
-        # If we hit 5 consecutive failures, assume blocking and exit early
         consecutive_failures = 0
+        batch_count = 0
+        batch_id = 0
+        batch_start_idx = start_n
+        batch_success, batch_fail, batch_block = 0, 0, 0
+        batch_start_time = time.time()
+
         for i, ubi in enumerate(slice_ubis, start=start_n):
             status = process_ubi(driver, ubi, i, total)
             log_progress(ubi, i, total, status)
 
-            if status and status.startswith("success"):
+            if status.lower().startswith("success"):
                 consecutive_failures = 0
-            elif status and (status.startswith("fail") or status.startswith("blocked")):
+                batch_success += 1
+            elif status.lower().startswith("fail"):
                 consecutive_failures += 1
+                batch_fail += 1
+            elif status.lower().startswith("blocked"):
+                consecutive_failures += 1
+                batch_block += 1
             else:
                 consecutive_failures = 0
 
+            batch_count += 1
+
+            # --- forced cooldown on consecutive failures ---
             if consecutive_failures >= 5:
-                dual_log(f"[WARN] Hit 5 consecutive failures at UBI {ubi}. Auto-exiting for measurement run.")
-                break
+                cooldown = 15 * 60
+                batch_id += 1
+                elapsed = int(time.time() - batch_start_time)
+                log_batch(batch_id, batch_start_idx, i, batch_success, batch_fail, batch_block, elapsed, cooldown)
+                dual_log(f"[WARN] Hit {consecutive_failures} consecutive failures. Cooling {cooldown}s.")
+                time.sleep(cooldown)
+                # reset batch
+                batch_start_idx = i + 1
+                batch_start_time = time.time()
+                batch_success, batch_fail, batch_block = 0, 0, 0
+                consecutive_failures = 0
+                batch_count = 0
+
+            # --- regular batch cooldown ---
+            elif batch_count >= args.batch_size:
+                cooldown = args.cooldown
+                batch_id += 1
+                elapsed = int(time.time() - batch_start_time)
+                log_batch(batch_id, batch_start_idx, i, batch_success, batch_fail, batch_block, elapsed, cooldown)
+                dual_log(f"[INFO] Completed batch of {batch_count} UBIs. Cooling {cooldown}s.")
+                time.sleep(cooldown)
+                # reset batch
+                batch_start_idx = i + 1
+                batch_start_time = time.time()
+                batch_success, batch_fail, batch_block = 0, 0, 0
+                batch_count = 0
 
     # After all done, append measurements
     end_time = time.time()
@@ -604,6 +723,8 @@ def main():
 
     dual_log(f"[INFO] Measurements appended to {MEASUREMENTS_FILE}")
     summarize_log()
+    summarize_batches()
+
 
 
 if __name__ == "__main__":
