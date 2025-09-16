@@ -75,6 +75,12 @@ logger.addHandler(handler)
 
 # --- progress tracking globals ---
 MEASUREMENTS_FILE = LOG_DIR / "ccfs_measurements.csv"
+BATCH_FILE = LOG_DIR / "ccfs_batches.csv"
+
+# ensure header
+if not BATCH_FILE.exists():
+    with BATCH_FILE.open("w", encoding="utf-8", newline="") as f:
+        f.write("timestamp,batch_id,start_idx,end_idx,successes,fails,blocks,elapsed_sec,cooldown_sec\n")
 
 # runtime / counters used by log_progress()
 start_time = None
@@ -234,13 +240,6 @@ def summarize_batches(batch_path: Path = BATCH_FILE):
 
 
 # ----------------------- Per-Batch Logging -----------------------
-BATCH_FILE = LOG_DIR / "ccfs_batches.csv"
-
-# ensure header
-if not BATCH_FILE.exists():
-    with BATCH_FILE.open("w", encoding="utf-8", newline="") as f:
-        f.write("timestamp,batch_id,start_idx,end_idx,successes,fails,blocks,elapsed_sec,cooldown_sec\n")
-
 def log_batch(batch_id, start_idx, end_idx, successes, fails, blocks, elapsed_sec, cooldown_sec):
     """
     Append one row of batch metrics to ccfs_batches.csv
