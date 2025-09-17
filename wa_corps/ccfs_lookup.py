@@ -96,7 +96,21 @@ first_block_at_index = None
 # ensure file has header if it doesn’t exist
 if not MEASUREMENTS_FILE.exists():
     with MEASUREMENTS_FILE.open("w", encoding="utf-8", newline="") as f:
-        f.write("timestamp,total_ubis,successes,fails,blocks,elapsed_sec,first_block_idx\n")
+        f.write("timestamp,total_ubis,successes,fails,blocks,skips,elapsed_sec,first_block_idx\n")
+else:
+    # check header retroactively
+    with MEASUREMENTS_FILE.open("r", encoding="utf-8") as f:
+        header = f.readline().strip()
+    if "skips" not in header:
+        tmp = MEASUREMENTS_FILE.with_suffix(".tmp")
+        with MEASUREMENTS_FILE.open("r", encoding="utf-8") as fin, tmp.open("w", encoding="utf-8") as fout:
+            fout.write(header.replace("elapsed_sec,", "skips,elapsed_sec,") + "\n")
+            for line in fin:
+                parts = line.strip().split(",")
+                if len(parts) == 7:  # old format
+                    parts.insert(5, "")  # blank skips
+                fout.write(",".join(parts) + "\n")
+        tmp.replace(MEASUREMENTS_FILE)
         
 
 # -------------------- logging & progress tracking helpers --------------------
@@ -241,21 +255,14 @@ def summarize_batches(batch_path: Path = BATCH_FILE):
 
 
 # ----------------------- Per-Batch Logging -----------------------
-def log_batch(batch_id, start_idx, end_idx, successes, fails, blocks, elapsed_sec, cooldown_sec):
-    """
-    Append one row of batch metrics to ccfs_batches.csv
-    """
-    with BATCH_FILE.open("a", encoding="utf-8", newline="") as f:
-        f.write(
-            f"{datetime.now().isoformat()},"
-            f"{batch_id},{start_idx},{end_idx},"
-            f"{successes},{fails},{blocks},"
-            f"{elapsed_sec},{cooldown_sec}\n"
-        )
-
+def log_batch(batch_id, start_idx, end_idx, succ, fail, block, skip, elapsed, cooldown):
+    line = (f"{datetime.now().isoformat()},{batch_id},{start_idx},{end_idx},"
+            f"{succ},{fail},{block},{skip},{elapsed},{cooldown}\n")
+    with BATCH_FILE.open("a", encoding="utf-8") as f:
+        f.write(line)
     dual_log(f"[BATCH] #{batch_id} | UBIs {start_idx}-{end_idx} | "
-             f"Succ={successes} Fail={fails} Block={blocks} | "
-             f"Elapsed={elapsed_sec}s | Cooldown={cooldown_sec}s")
+             f"Succ={succ} Fail={fail} Block={block} Skip={skip} "
+             f"| Elapsed={elapsed}s | Cooldown={cooldown}s")
 
 
 # ----------------------- HTML parsing helpers -----------------------
@@ -621,12 +628,13 @@ def main():
                         help="Base cooldown seconds between batches (adaptive)")
     args = parser.parse_args()
 
-    global start_time, success_count, fail_count, block_detected, block_count, first_block_at_index
+    global start_time, success_count, fail_count, block_detected, block_count, skip_count, first_block_at_index
     start_time = time.time()
     success_count = 0
     fail_count = 0
     block_detected = False
     block_count = 0
+    skip_count = 0
     first_block_at_index = None
 
     if not INPUT_CSV.exists():
@@ -665,10 +673,20 @@ def main():
         batch_count = 0
         batch_id = 0
         batch_start_idx = start_n
-        batch_success, batch_fail, batch_block = 0, 0, 0
+        batch_success, batch_fail, batch_block, batch_skip = 0, 0, 0, 0
         batch_start_time = time.time()
 
         for i, ubi in enumerate(slice_ubis, start=start_n):
+            ubi_dir = PDF_DIR / ubi.replace(" ", "")
+            pdf_path = ubi_dir / "annual_report.pdf"
+            json_path = JSON_DIR / f"{ubi.replace(' ', '')}.json"
+
+            if pdf_path.exists() and json_path.exists():
+                skip_count += 1
+                batch_skip += 1
+                dual_log(f"[SKIP] UBI {i}/{total}: {ubi} already has JSON + PDF, skipping.")
+                continue
+
             # --- per-UBI jitter to avoid bursts ---
             jitter = random.randint(5, 15)
             time.sleep(jitter)
@@ -703,7 +721,7 @@ def main():
                 # reset batch
                 batch_start_idx = i + 1
                 batch_start_time = time.time()
-                batch_success, batch_fail, batch_block = 0, 0, 0
+                batch_success, batch_fail, batch_block, batch_skip = 0, 0, 0, 0
                 consecutive_failures = 0
                 batch_count = 0
                 continue
@@ -745,7 +763,7 @@ def main():
     with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
         f.write(
             f"{datetime.now().isoformat()},"
-            f"{len(slice_ubis)},{success_count},{fail_count},{block_count},"
+            f"{len(slice_ubis)},{success_count},{fail_count},{block_count},{skip_count},"
             f"{elapsed_sec},{first_block_at_index or ''}\n"
         )
     dual_log(f"[INFO] Measurements appended to {MEASUREMENTS_FILE}")

@@ -1647,6 +1647,289 @@ Want me to also add **per-batch summary lines** into the measurements CSV (with 
 
 -------------------------------------------------------------------------------
 
+Got it ✅ — the skip check is straightforward and won’t break your adaptive cooldown logic. We’ll just check before `process_ubi()` if both the JSON and PDF exist for that UBI. If so, we log and skip immediately.
+
+Here’s how you can integrate it:
+
+---
+
+### Update inside `main()` loop:
+
+```python
+        for i, ubi in enumerate(slice_ubis, start=start_n):
+            ubi_dir = PDF_DIR / ubi.replace(" ", "")
+            pdf_path = ubi_dir / "annual_report.pdf"
+            json_path = JSON_DIR / f"{ubi.replace(' ', '')}.json"
+
+            if pdf_path.exists() and json_path.exists():
+                dual_log(f"[SKIP] UBI {ubi} already has JSON + PDF, skipping.")
+                continue
+
+            # --- per-UBI jitter to avoid bursts ---
+            jitter = random.randint(5, 15)
+            time.sleep(jitter)
+
+            status = process_ubi(driver, ubi, i, total)
+            log_progress(ubi, i, total, status)
+```
+
+---
+
+### Why both JSON and PDF?
+
+* If **only JSON exists**: we still want to try downloading the annual report again.
+* If **only PDF exists**: we still want JSON for metadata.
+* If **both exist**: fully processed → safe to skip.
+
+---
+
+This way, re-runs won’t waste time (or trigger rate limiting) on UBIs you’ve already processed.
+
+Do you also want me to add a **counter for skipped UBIs** into your logs and batch summaries, so you can track how many were skipped in each run?
+
+-------------------------------------------------------------------------------
+
+Perfect — we’ll add a **skip counter** into:
+
+1. **Per-UBI logging** → `[SKIP]` line when a UBI is skipped.
+2. **Batch stats** → include `skipped` count alongside successes/fails/blocks.
+3. **Final summary** → include total skips.
+4. **Measurements CSV** → add a `skips` column.
+
+---
+
+### Changes
+
+#### 1. Initialize skip counter
+
+At top of `main()`:
+
+```python
+    global start_time, success_count, fail_count, block_detected, block_count, first_block_at_index, skip_count
+    start_time = time.time()
+    success_count = 0
+    fail_count = 0
+    block_detected = False
+    block_count = 0
+    skip_count = 0
+    first_block_at_index = None
+```
+
+---
+
+#### 2. Per-UBI skip check
+
+Inside `for i, ubi in enumerate(slice_ubis, start=start_n):`
+
+```python
+            ubi_dir = PDF_DIR / ubi.replace(" ", "")
+            pdf_path = ubi_dir / "annual_report.pdf"
+            json_path = JSON_DIR / f"{ubi.replace(' ', '')}.json"
+
+            if pdf_path.exists() and json_path.exists():
+                skip_count += 1
+                batch_skip += 1
+                dual_log(f"[SKIP] UBI {i}/{total}: {ubi} already has JSON + PDF, skipping.")
+                continue
+```
+
+---
+
+#### 3. Track in batch
+
+Initialize at batch start:
+
+```python
+        batch_success, batch_fail, batch_block, batch_skip = 0, 0, 0, 0
+```
+
+Reset after cooldown same way:
+
+```python
+        batch_success, batch_fail, batch_block, batch_skip = 0, 0, 0, 0
+```
+
+---
+
+#### 4. Update `log_batch`
+
+Change signature + log line to include skips:
+
+```python
+def log_batch(batch_id, start_idx, end_idx, succ, fail, block, skip, elapsed, cooldown):
+    line = (f"{datetime.now().isoformat()},{batch_id},{start_idx},{end_idx},"
+            f"{succ},{fail},{block},{skip},{elapsed},{cooldown}\n")
+    with BATCHES_FILE.open("a", encoding="utf-8") as f:
+        f.write(line)
+    dual_log(f"[BATCH] #{batch_id} | UBIs {start_idx}-{end_idx} | "
+             f"Succ={succ} Fail={fail} Block={block} Skip={skip} "
+             f"| Elapsed={elapsed}s | Cooldown={cooldown}s")
+```
+
+---
+
+#### 5. Measurements CSV
+
+At end of `main()`:
+
+```python
+    with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
+        f.write(
+            f"{datetime.now().isoformat()},"
+            f"{len(slice_ubis)},{success_count},{fail_count},{block_count},{skip_count},"
+            f"{elapsed_sec},{first_block_at_index or ''}\n"
+        )
+```
+
+---
+
+#### 6. Summaries
+
+Update `summarize_batches()` and `summarize_log()` to print skip counts.
+E.g. in summary:
+
+```
+==== SUMMARY ====
+Total successes: X
+Total fails: Y
+Total blocked: Z
+Total skipped: W
+=================
+```
+
+---
+
+👉 Do you want me to also **retrofit your existing `ccfs_measurements.csv`** (add a `skips` column header even if past rows have blanks), so all runs are compatible going forward?
+
+-------------------------------------------------------------------------------
+
+Got it 👍
+
+Here’s exactly what I’ll change for **skip support + retrofitting your existing CSVs**:
+
+---
+
+### 1. Add `skip_count` globally
+
+```python
+global start_time, success_count, fail_count, block_detected, block_count, skip_count, first_block_at_index
+...
+skip_count = 0
+```
+
+---
+
+### 2. Check per-UBI for existing outputs
+
+```python
+ubi_dir = BUSINESS_PDF_DIR / ubi.replace(" ", "")
+pdf_path = ubi_dir / "annual_report.pdf"
+json_path = BUSINESS_JSON_DIR / f"{ubi.replace(' ', '')}.json"
+
+if pdf_path.exists() and json_path.exists():
+    skip_count += 1
+    batch_skip += 1
+    dual_log(f"[SKIP] UBI {i}/{total}: {ubi} already has JSON + PDF, skipping.")
+    continue
+```
+
+---
+
+### 3. Track in batch
+
+Initialize:
+
+```python
+batch_success, batch_fail, batch_block, batch_skip = 0, 0, 0, 0
+```
+
+Reset after cooldown with same four variables.
+
+---
+
+### 4. Update `log_batch`
+
+Now include `skip` column:
+
+```python
+def log_batch(batch_id, start_idx, end_idx, succ, fail, block, skip, elapsed, cooldown):
+    line = (f"{datetime.now().isoformat()},{batch_id},{start_idx},{end_idx},"
+            f"{succ},{fail},{block},{skip},{elapsed},{cooldown}\n")
+    with BATCHES_FILE.open("a", encoding="utf-8") as f:
+        f.write(line)
+    dual_log(f"[BATCH] #{batch_id} | UBIs {start_idx}-{end_idx} | "
+             f"Succ={succ} Fail={fail} Block={block} Skip={skip} "
+             f"| Elapsed={elapsed}s | Cooldown={cooldown}s")
+```
+
+---
+
+### 5. Final measurement CSV
+
+Write skips into `ccfs_measurements.csv`:
+
+```python
+with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
+    f.write(
+        f"{datetime.now().isoformat()},"
+        f"{len(slice_ubis)},{success_count},{fail_count},{block_count},{skip_count},"
+        f"{elapsed_sec},{first_block_at_index or ''}\n"
+    )
+```
+
+---
+
+### 6. Retrofitting `ccfs_measurements.csv`
+
+On startup, ensure file has `skips` column header:
+
+```python
+if not MEASUREMENTS_FILE.exists():
+    with MEASUREMENTS_FILE.open("w", encoding="utf-8", newline="") as f:
+        f.write("timestamp,total_ubis,successes,fails,blocks,skips,elapsed_sec,first_block_idx\n")
+else:
+    # check header retroactively
+    with MEASUREMENTS_FILE.open("r", encoding="utf-8") as f:
+        header = f.readline().strip()
+    if "skips" not in header:
+        tmp = MEASUREMENTS_FILE.with_suffix(".tmp")
+        with MEASUREMENTS_FILE.open("r", encoding="utf-8") as fin, tmp.open("w", encoding="utf-8") as fout:
+            fout.write(header.replace("elapsed_sec,", "skips,elapsed_sec,") + "\n")
+            for line in fin:
+                parts = line.strip().split(",")
+                if len(parts) == 7:  # old format
+                    parts.insert(5, "")  # blank skips
+                fout.write(",".join(parts) + "\n")
+        tmp.replace(MEASUREMENTS_FILE)
+```
+
+---
+
+### 7. Summaries
+
+Print skip totals:
+
+```
+==== SUMMARY ====
+Total successes: X
+Total fails: Y
+Total blocked: Z
+Total skipped: W
+=================
+```
+
+---
+
+✅ This way:
+
+* Old `ccfs_measurements.csv` gets automatically patched to include `skips`.
+* All new runs record and log skips consistently.
+* Batches + summaries show skips.
+
+Do you also want **skips added to `ccfs_batches.csv`** retroactively, same as measurements, or is it fine if that only applies going forward?
+
+-------------------------------------------------------------------------------
+
 
 -------------------------------------------------------------------------------
 
