@@ -677,9 +677,9 @@ def main():
         batch_start_time = time.time()
 
         for i, ubi in enumerate(slice_ubis, start=start_n):
-            ubi_dir = PDF_DIR / ubi.replace(" ", "")
+            ubi_dir = BUSINESS_PDF_DIR / ubi.replace(" ", "")
             pdf_path = ubi_dir / "annual_report.pdf"
-            json_path = JSON_DIR / f"{ubi.replace(' ', '')}.json"
+            json_path = JSON_OUTPUT_DIR / f"{ubi.replace(' ', '')}.json"
 
             if pdf_path.exists() and json_path.exists():
                 skip_count += 1
