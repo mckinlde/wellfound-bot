@@ -1932,6 +1932,8 @@ Do you also want **skips added to `ccfs_batches.csv`** retroactively, same as me
 
 ToDo: unhandled edge case when no annual report b/c only docs are 'Initial Report' and 'Certificate of Formation'
 
+ToDo: unhandled adge case where skips do not reset fail counter, so exponential backoff (1hr sleep) is triggered unnecessarily
+
 -------------------------------------------------------------------------------
 
 
