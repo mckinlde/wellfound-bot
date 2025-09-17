@@ -617,8 +617,8 @@ def main():
     parser.add_argument("--stop_n", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=50,
                         help="Number of UBIs to process before cooldown")
-    parser.add_argument("--cooldown", type=int, default=60*60,
-                        help="Base cooldown seconds between batches (adaptive if blocked)")
+    parser.add_argument("--cooldown", type=int, default=3600,
+                        help="Base cooldown seconds between batches (adaptive)")
     args = parser.parse_args()
 
     global start_time, success_count, fail_count, block_detected, block_count, first_block_at_index
@@ -633,7 +633,7 @@ def main():
         print(f"[ERROR] Input CSV not found: {INPUT_CSV}")
         sys.exit(1)
 
-    # Read all UBIs
+    # Read UBIs
     with INPUT_CSV.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         ubis = [row["UBI#"].strip() for row in reader if row.get("UBI#")]
@@ -654,8 +654,9 @@ def main():
     print(f"[INFO] Loaded {total} UBIs, processing {len(slice_ubis)} (rows {start_n}..{stop_n})")
 
     # Adaptive cooldown state
-    base_cooldown = args.cooldown
-    max_cooldown = 3600*8  # cap at 8h
+    cooldown = args.cooldown
+    min_cooldown = 600       # 10 minutes floor
+    max_cooldown = 3600 * 8  # cap at 8h
     consecutive_block_batches = 0
 
     with start_driver() as driver:
@@ -693,9 +694,8 @@ def main():
             if consecutive_failures >= 5:
                 batch_id += 1
                 elapsed = int(time.time() - batch_start_time)
-                # exponential cooldown for blocks
                 consecutive_block_batches += 1
-                cooldown = min(base_cooldown * (2 ** (consecutive_block_batches - 1)), max_cooldown)
+                cooldown = min(3600 * (2 ** (consecutive_block_batches - 1)), max_cooldown)
                 log_batch(batch_id, batch_start_idx, i,
                           batch_success, batch_fail, batch_block, elapsed, cooldown)
                 dual_log(f"[WARN] Hit {consecutive_failures} consecutive failures. Cooling {cooldown}s (exp backoff).")
@@ -706,21 +706,28 @@ def main():
                 batch_success, batch_fail, batch_block = 0, 0, 0
                 consecutive_failures = 0
                 batch_count = 0
-                continue  # move on to next UBI
+                continue
 
             # --- regular batch cooldown ---
             if batch_count >= args.batch_size:
                 batch_id += 1
                 elapsed = int(time.time() - batch_start_time)
 
-                if batch_block > 0:
+                if batch_block > 0 and batch_success == 0:
+                    # fully blocked
                     consecutive_block_batches += 1
-                    cooldown = min(base_cooldown * (2 ** (consecutive_block_batches - 1)), max_cooldown)
-                    dual_log(f"[WARN] Batch #{batch_id} had {batch_block} blocks. Cooling {cooldown}s (exp backoff).")
-                else:
+                    cooldown = min(3600 * (2 ** (consecutive_block_batches - 1)), max_cooldown)
+                    dual_log(f"[WARN] Batch #{batch_id} fully blocked. Cooling {cooldown}s (exp backoff).")
+                elif batch_block > 0:
+                    # partial block
                     consecutive_block_batches = 0
-                    cooldown = base_cooldown
-                    dual_log(f"[INFO] Completed batch of {batch_count} UBIs. Cooling {cooldown}s.")
+                    cooldown = min(int(cooldown * 1.25), max_cooldown)
+                    dual_log(f"[WARN] Batch #{batch_id} had {batch_block} blocks. Cooling {cooldown}s (+25%).")
+                else:
+                    # success
+                    consecutive_block_batches = 0
+                    cooldown = max(int(cooldown * 0.9), min_cooldown)
+                    dual_log(f"[INFO] Batch #{batch_id} succeeded. Cooling {cooldown}s (-10%).")
 
                 log_batch(batch_id, batch_start_idx, i,
                           batch_success, batch_fail, batch_block, elapsed, cooldown)
@@ -732,17 +739,15 @@ def main():
                 batch_success, batch_fail, batch_block = 0, 0, 0
                 batch_count = 0
 
-    # After all done, append measurements
+    # Final measurements
     end_time = time.time()
     elapsed_sec = int(end_time - start_time)
-
     with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
         f.write(
             f"{datetime.now().isoformat()},"
             f"{len(slice_ubis)},{success_count},{fail_count},{block_count},"
             f"{elapsed_sec},{first_block_at_index or ''}\n"
         )
-
     dual_log(f"[INFO] Measurements appended to {MEASUREMENTS_FILE}")
     summarize_log()
     summarize_batches()

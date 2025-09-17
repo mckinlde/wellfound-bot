@@ -1306,12 +1306,344 @@ Do you want me to also make the **cooldown strategy visible in the measurements 
 
 -------------------------------------------------------------------------------
 
+Nice, thanks for sharing the batch-level log — this is exactly the kind of data you need to tune throttling. Let’s look at the pattern:
+
+---
+
+### Batch Results Recap
+
+```
+Batch 1 (25 UBIs) → 16 succ, 5 fail, 4 block → 900s cooldown
+Batch 2 (5 UBIs)  → all blocked → 900s cooldown
+Batch 3 (5 UBIs)  → all blocked → 900s cooldown
+
+Batch 1 (50 UBIs) → 35 succ, 13 fail, 2 block → 3600s cooldown
+Batch 2 (50 UBIs) → 32 succ, 18 fail, 0 block → 3600s cooldown
+Batch 3 (50 UBIs) → 38 succ, 12 fail, 0 block → 3600s cooldown
+Batch 4 (50 UBIs) → 26 succ, 24 fail, 0 block → 3600s cooldown
+Batch 5 (50 UBIs) → 37 succ, 13 fail, 0 block → 3600s cooldown
+```
+
+---
+
+### What this tells us
+
+1. **Short cooldowns (900s = 15min) were not enough**
+   You hit immediate blocking after the first small batch. Cloudflare rate-limit hadn’t reset fully.
+
+2. **Longer cooldowns (3600s = 1h) worked much better**
+   After the switch, you consistently got \~70–80% success per batch, with blocks basically gone.
+
+   * Fails are still \~20–25% — likely timeouts/network retries, not rate limits.
+   * No consistent blocking until the very first batch of 50 (2 blocks, then gone).
+
+3. **Throughput balance**
+   At 50 UBIs per \~27min batch (elapsed\_sec \~1600s), plus a 1h cooldown, you’re netting \~35–40 UBIs/hr.
+   Scaling: \~1k UBIs/day per machine if you let it run continuously.
+
+---
+
+### Suggested Tuning
+
+* **Batch size:** 40–50 UBIs seems safe (keeps elapsed time per batch around 25–30min).
+* **Cooldown:** Stick with **3600s (1h)** between batches — this clearly clears the Cloudflare 1015 threshold.
+
+  * You could experiment with 2700s (45min), but don’t go shorter unless you want to risk creeping block rates.
+* **Dynamic adjustment:** Add logic:
+
+  * If a batch has >5 blocks → bump next cooldown +30min.
+  * If a batch has 0 blocks for 3 runs → try reducing cooldown by 15min (to probe the threshold).
+
+---
+
+### Recommendation for your script
+
+Default params:
+
+```bash
+--batch_size 50 --cooldown 3600
+```
+
+And let the adaptive logic shrink/grow around those anchors.
+
+---
+
+Would you like me to write a **dynamic cooldown manager** for you — so instead of fixed `--cooldown`, it automatically increases/decreases based on the last batch’s block/fail ratio? That way you can maximize throughput without babysitting.
 
 -------------------------------------------------------------------------------
 
+Perfect — here’s how you can drop in a **dynamic cooldown manager** without breaking your existing batch/failure handling. It wraps your current `cooldown` with a feedback loop based on recent batch outcomes.
+
+---
+
+### Updated main loop (excerpt)
+
+```python
+        adaptive_cooldown = args.cooldown  # start from user-supplied baseline
+        min_cooldown = 1200                # 20 min floor
+        max_cooldown = 7200                # 2 hr ceiling
+
+        for i, ubi in enumerate(slice_ubis, start=start_n):
+            status = process_ubi(driver, ubi, i, total)
+            log_progress(ubi, i, total, status)
+
+            if status.lower().startswith("success"):
+                consecutive_failures = 0
+                batch_success += 1
+            elif status.lower().startswith("fail"):
+                consecutive_failures += 1
+                batch_fail += 1
+            elif status.lower().startswith("blocked"):
+                consecutive_failures += 1
+                batch_block += 1
+            else:
+                consecutive_failures = 0
+
+            batch_count += 1
+
+            # --- forced cooldown on consecutive failures ---
+            if consecutive_failures >= 5:
+                cooldown = 15 * 60
+                batch_id += 1
+                elapsed = int(time.time() - batch_start_time)
+                log_batch(batch_id, batch_start_idx, i, batch_success, batch_fail, batch_block, elapsed, cooldown)
+                dual_log(f"[WARN] Hit {consecutive_failures} consecutive failures. Cooling {cooldown}s.")
+                time.sleep(cooldown)
+
+                # reset batch + adaptive_cooldown unchanged
+                batch_start_idx = i + 1
+                batch_start_time = time.time()
+                batch_success = batch_fail = batch_block = batch_count = consecutive_failures = 0
+
+            # --- regular batch cooldown ---
+            elif batch_count >= args.batch_size:
+                cooldown = adaptive_cooldown
+                batch_id += 1
+                elapsed = int(time.time() - batch_start_time)
+                log_batch(batch_id, batch_start_idx, i, batch_success, batch_fail, batch_block, elapsed, cooldown)
+
+                # --- adaptive tuning here ---
+                block_rate = batch_block / max(1, batch_count)
+                fail_rate = batch_fail / max(1, batch_count)
+
+                if block_rate >= 0.1:  # >10% blocked → increase cooldown
+                    adaptive_cooldown = min(max_cooldown, int(adaptive_cooldown * 1.25))
+                    dual_log(f"[ADAPT] High block rate ({block_rate:.1%}), increasing cooldown → {adaptive_cooldown}s")
+                elif block_rate == 0 and fail_rate < 0.2:
+                    adaptive_cooldown = max(min_cooldown, int(adaptive_cooldown * 0.9))
+                    dual_log(f"[ADAPT] Clean batch, decreasing cooldown → {adaptive_cooldown}s")
+                else:
+                    dual_log(f"[ADAPT] Keeping cooldown at {adaptive_cooldown}s")
+
+                dual_log(f"[INFO] Completed batch of {batch_count} UBIs. Cooling {cooldown}s.")
+                time.sleep(cooldown)
+
+                # reset batch
+                batch_start_idx = i + 1
+                batch_start_time = time.time()
+                batch_success = batch_fail = batch_block = batch_count = 0
+```
+
+---
+
+### What this does
+
+* Starts at `--cooldown` (say 3600s).
+* **If ≥10% blocked in a batch** → increase cooldown by +25%, up to 2h.
+* **If no blocks + <20% fails** → decrease cooldown by −10%, down to 20min.
+* Otherwise → leave cooldown unchanged.
+* Forced cooldowns on 5 consecutive failures are **separate** and don’t affect the adaptive cooldown.
+
+---
+
+### Example
+
+* Batch 1: 35/50 success, 13 fail, 2 block → block rate = 4% → stays at 3600s.
+* Batch 2: 50/50 clean → cooldown drops to 3240s.
+* Batch 3: 50/50 clean again → cooldown drops to \~2900s.
+* Batch 4: 20% blocked → cooldown jumps back up toward 4500s.
+
+---
+
+Do you want me to also **log adaptive cooldown changes into your measurements CSV** (extra column), so you can analyze cooldown behavior later?
 
 -------------------------------------------------------------------------------
 
+Perfect — we can fold your requested **adaptive cooldown logic** right into the `main()` without breaking the rest of your logging / measurement system. Here’s the plan:
+
+### Adaptive Cooldown Rules
+
+* **Successful batch (no blocks, mostly successes):**
+
+  * Reduce cooldown by **10%**, down to a floor of e.g. 600 s (10 min).
+* **Partially blocked batch (≥1 block but not fully blocked):**
+
+  * Increase cooldown by **25%**, capped by `max_cooldown`.
+* **Fully blocked (all UBIs in batch blocked or 5 consecutive fails):**
+
+  * Use exponential backoff, starting at **3600 s (1h)**, doubling up to `max_cooldown`.
+
+---
+
+Here’s the updated `main()` implementation with your adaptive cooldown integrated:
+
+```python
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start_n", type=int, default=1)
+    parser.add_argument("--stop_n", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=50,
+                        help="Number of UBIs to process before cooldown")
+    parser.add_argument("--cooldown", type=int, default=3600,
+                        help="Base cooldown seconds between batches (adaptive)")
+    args = parser.parse_args()
+
+    global start_time, success_count, fail_count, block_detected, block_count, first_block_at_index
+    start_time = time.time()
+    success_count = 0
+    fail_count = 0
+    block_detected = False
+    block_count = 0
+    first_block_at_index = None
+
+    if not INPUT_CSV.exists():
+        print(f"[ERROR] Input CSV not found: {INPUT_CSV}")
+        sys.exit(1)
+
+    # Read UBIs
+    with INPUT_CSV.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        ubis = [row["UBI#"].strip() for row in reader if row.get("UBI#")]
+
+    total = len(ubis)
+    if total == 0:
+        print("[ERROR] No UBIs found in input CSV")
+        sys.exit(1)
+
+    start_n = max(1, args.start_n)
+    stop_n = args.stop_n if args.stop_n is not None else total
+    if start_n > total:
+        print(f"[ERROR] start_n {start_n} > total {total}")
+        sys.exit(1)
+    stop_n = min(stop_n, total)
+
+    slice_ubis = ubis[start_n - 1: stop_n]
+    print(f"[INFO] Loaded {total} UBIs, processing {len(slice_ubis)} (rows {start_n}..{stop_n})")
+
+    # Adaptive cooldown state
+    cooldown = args.cooldown
+    min_cooldown = 600       # 10 minutes floor
+    max_cooldown = 3600 * 8  # cap at 8h
+    consecutive_block_batches = 0
+
+    with start_driver() as driver:
+        driver.get(BASE_URL)
+        consecutive_failures = 0
+        batch_count = 0
+        batch_id = 0
+        batch_start_idx = start_n
+        batch_success, batch_fail, batch_block = 0, 0, 0
+        batch_start_time = time.time()
+
+        for i, ubi in enumerate(slice_ubis, start=start_n):
+            # --- per-UBI jitter to avoid bursts ---
+            jitter = random.randint(5, 15)
+            time.sleep(jitter)
+
+            status = process_ubi(driver, ubi, i, total)
+            log_progress(ubi, i, total, status)
+
+            if status.lower().startswith("success"):
+                consecutive_failures = 0
+                batch_success += 1
+            elif status.lower().startswith("fail"):
+                consecutive_failures += 1
+                batch_fail += 1
+            elif status.lower().startswith("blocked"):
+                consecutive_failures += 1
+                batch_block += 1
+            else:
+                consecutive_failures = 0
+
+            batch_count += 1
+
+            # --- forced cooldown on consecutive failures ---
+            if consecutive_failures >= 5:
+                batch_id += 1
+                elapsed = int(time.time() - batch_start_time)
+                consecutive_block_batches += 1
+                cooldown = min(3600 * (2 ** (consecutive_block_batches - 1)), max_cooldown)
+                log_batch(batch_id, batch_start_idx, i,
+                          batch_success, batch_fail, batch_block, elapsed, cooldown)
+                dual_log(f"[WARN] Hit {consecutive_failures} consecutive failures. Cooling {cooldown}s (exp backoff).")
+                time.sleep(cooldown)
+                # reset batch
+                batch_start_idx = i + 1
+                batch_start_time = time.time()
+                batch_success, batch_fail, batch_block = 0, 0, 0
+                consecutive_failures = 0
+                batch_count = 0
+                continue
+
+            # --- regular batch cooldown ---
+            if batch_count >= args.batch_size:
+                batch_id += 1
+                elapsed = int(time.time() - batch_start_time)
+
+                if batch_block > 0 and batch_success == 0:
+                    # fully blocked
+                    consecutive_block_batches += 1
+                    cooldown = min(3600 * (2 ** (consecutive_block_batches - 1)), max_cooldown)
+                    dual_log(f"[WARN] Batch #{batch_id} fully blocked. Cooling {cooldown}s (exp backoff).")
+                elif batch_block > 0:
+                    # partial block
+                    consecutive_block_batches = 0
+                    cooldown = min(int(cooldown * 1.25), max_cooldown)
+                    dual_log(f"[WARN] Batch #{batch_id} had {batch_block} blocks. Cooling {cooldown}s (+25%).")
+                else:
+                    # success
+                    consecutive_block_batches = 0
+                    cooldown = max(int(cooldown * 0.9), min_cooldown)
+                    dual_log(f"[INFO] Batch #{batch_id} succeeded. Cooling {cooldown}s (-10%).")
+
+                log_batch(batch_id, batch_start_idx, i,
+                          batch_success, batch_fail, batch_block, elapsed, cooldown)
+
+                time.sleep(cooldown)
+                # reset batch
+                batch_start_idx = i + 1
+                batch_start_time = time.time()
+                batch_success, batch_fail, batch_block = 0, 0, 0
+                batch_count = 0
+
+    # Final measurements
+    end_time = time.time()
+    elapsed_sec = int(end_time - start_time)
+    with MEASUREMENTS_FILE.open("a", encoding="utf-8", newline="") as f:
+        f.write(
+            f"{datetime.now().isoformat()},"
+            f"{len(slice_ubis)},{success_count},{fail_count},{block_count},"
+            f"{elapsed_sec},{first_block_at_index or ''}\n"
+        )
+    dual_log(f"[INFO] Measurements appended to {MEASUREMENTS_FILE}")
+    summarize_log()
+    summarize_batches()
+```
+
+---
+
+✨ Changes vs. your last `main()`:
+
+* Added `min_cooldown = 600` (10 min floor).
+* On **success batch** → cooldown = max(cooldown × 0.9, min).
+* On **partial block** → cooldown = min(cooldown × 1.25, max).
+* On **full block** → exponential backoff starting at 1h.
+
+This way the script **automatically adapts** based on observed block pressure.
+
+---
+
+Want me to also add **per-batch summary lines** into the measurements CSV (with the adjusted cooldown values), so you can track how the cooldown evolves across runs?
 
 -------------------------------------------------------------------------------
 
