@@ -715,7 +715,8 @@ def main():
                 consecutive_block_batches += 1
                 cooldown = min(3600 * (2 ** (consecutive_block_batches - 1)), max_cooldown)
                 log_batch(batch_id, batch_start_idx, i,
-                          batch_success, batch_fail, batch_block, elapsed, cooldown)
+                            batch_success, batch_fail, batch_block, batch_skip, 
+                            elapsed, cooldown)
                 dual_log(f"[WARN] Hit {consecutive_failures} consecutive failures. Cooling {cooldown}s (exp backoff).")
                 time.sleep(cooldown)
                 # reset batch
@@ -748,8 +749,9 @@ def main():
                     dual_log(f"[INFO] Batch #{batch_id} succeeded. Cooling {cooldown}s (-10%).")
 
                 log_batch(batch_id, batch_start_idx, i,
-                          batch_success, batch_fail, batch_block, elapsed, cooldown)
-
+                            batch_success, batch_fail, batch_block, batch_skip, 
+                            elapsed, cooldown)
+                
                 time.sleep(cooldown)
                 # reset batch
                 batch_start_idx = i + 1
