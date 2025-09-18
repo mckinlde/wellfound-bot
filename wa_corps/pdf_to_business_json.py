@@ -60,6 +60,7 @@ def extract_info(path):
 
     except Exception as e:
         print(f"[ERROR] Failed to parse {path}: {e}")
+        return None
 
     return info
 
@@ -81,17 +82,39 @@ def append_to_json(ubi, info):
     print(f"[OK] Appended filing to {path}")
 
 def main():
+    updated = 0
+    failed = 0
+
     for ubi in os.listdir(PDF_ROOT):
         ubi_path = os.path.join(PDF_ROOT, ubi)
         if not os.path.isdir(ubi_path):
             continue
 
-        for fname in os.listdir(ubi_path):
-            if fname.lower().endswith(".pdf"):
-                pdf_path = os.path.join(ubi_path, fname)
-                print(f"[STEP] Processing {ubi}/{fname}")
-                info = extract_info(pdf_path)
+        pdfs = [f for f in os.listdir(ubi_path) if f.lower().endswith(".pdf")]
+        if not pdfs:
+            print(f"[FAIL] No PDFs found for {ubi}")
+            failed += 1
+            continue
+
+        processed = False
+        for fname in pdfs:
+            pdf_path = os.path.join(ubi_path, fname)
+            print(f"[STEP] Processing {ubi}/{fname}")
+            info = extract_info(pdf_path)
+            if info:
                 append_to_json(ubi, info)
+                processed = True
+
+        if processed:
+            updated += 1
+        else:
+            print(f"[FAIL] Could not process any PDFs for {ubi}")
+            failed += 1
+
+    print("\n===== SUMMARY =====")
+    print(f"Businesses updated: {updated}")
+    print(f"Businesses failed : {failed}")
+    print("===================")
 
 if __name__ == "__main__":
     main()
