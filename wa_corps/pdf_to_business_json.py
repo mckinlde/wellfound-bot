@@ -66,20 +66,24 @@ def extract_info(path):
 
 def append_to_json(ubi, info):
     path = os.path.join(OUTPUT_DIR, f"{ubi}.json")
-    data = []
+    data = {"ubi": ubi, "filings": []}
+
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             try:
-                data = json.load(f)
+                loaded = json.load(f)
+                if isinstance(loaded, dict) and "filings" in loaded:
+                    data = loaded
             except json.JSONDecodeError:
-                data = []
+                pass
 
-    data.append(info)
+    data["filings"].append(info)
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
     print(f"[OK] Appended filing to {path}")
+
 
 def main():
     updated = 0
