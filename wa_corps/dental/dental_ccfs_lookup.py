@@ -20,6 +20,7 @@ import json
 import time
 import random
 import sys
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -43,15 +44,15 @@ from utils.driver_session import start_driver  # noqa
 from utils.SPA_utils import wait_scroll_interact, _safe_click_element
 
 # --- paths ---
-INPUT_CSV        = ROOT / "wa_corps" / "constants" / "Business Search Result.csv"
+INPUT_CSV        = ROOT / "wa_corps" / "dental" / "merged_deduped.csv"
 
-HTML_CAPTURE_DIR = ROOT / "wa_corps" / "html_captures"
+HTML_CAPTURE_DIR = ROOT / "wa_corps" / "dental" / "html_captures"
 HTML_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
 
-JSON_OUTPUT_DIR  = ROOT / "wa_corps" / "business_json"
+JSON_OUTPUT_DIR  = ROOT / "wa_corps" / "dental" / "business_json"
 JSON_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-BUSINESS_PDF_DIR = ROOT / "wa_corps" / "business_pdf"
+BUSINESS_PDF_DIR = ROOT / "wa_corps" / "dental" / "business_pdf"
 BUSINESS_PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -60,10 +61,11 @@ BASE_URL  = "https://ccfs.sos.wa.gov/"
 WAIT_TIME = 25  # generous; Angular SPA needs time
 
 # --- logging setup ---
-LOG_DIR = ROOT / "wa_corps" / "logs"
+LOG_DIR = ROOT / "wa_corps" / "dental" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-LOG_FILE = LOG_DIR / "ccfs_lookup.log"
+LOG_FILE = LOG_DIR / "dental" / "ccfs_lookup.log"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
 # Configure logger
 logger = logging.getLogger("ccfs")
