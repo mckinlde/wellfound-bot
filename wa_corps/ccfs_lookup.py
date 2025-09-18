@@ -20,6 +20,7 @@ import json
 import time
 import random
 import sys
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -64,6 +65,7 @@ LOG_DIR = ROOT / "wa_corps" / "dental" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_FILE = LOG_DIR / "dental" / "ccfs_lookup.log"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
 # Configure logger
 logger = logging.getLogger("ccfs")
