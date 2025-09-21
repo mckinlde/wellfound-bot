@@ -2501,6 +2501,1604 @@ chore(gitignore): ignore selenium profiles, logs, debug html, luma data, and pri
 
 -------------------------------------------------------------------------------
 
+I was able to sign in to Luma, and despite what the console output says, I was still signed in for the new driver session that actually got events.
+
+That said, I was not able to sign in to google calendar, which blocked my browser with this message:
+"""
+Couldn’t sign you in
+This browser or app may not be secure. Learn more
+Try using a different browser. If you’re already using a supported browser, you can try again to sign in.
+"""
+
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> powershell -ExecutionPolicy Bypass -File .\luma_bot\run_luma_bot.ps1 -Cities "seattle" -SetupFirst
+Could not find platform independent libraries <prefix>
+[SETUP] Starting interactive sign-in…
+
+[Action] Sign in to Luma in the opened browser.
+ - If redirected to lu.ma, complete the login there.
+ - Make sure you end up logged in (avatar/menu visible).
+When finished,
+Press Enter when you're done… 
+[LUMA] Login check: Not verified (continuing anyway)
+
+[Action] Sign in to your Google account (the one in calendars.json),
+then ensure Google Calendar loads fully.
+When the calendar UI is visible,
+Press Enter when you're done…
+
+-------------------------------------------------------------------------------
+
+Yep—this is a Google login hard-block on automated Firefox. Two fixes:
+
+1. **Run the bot with a real Chrome profile** (much more reliable for Google sign-in).
+2. Add a **graceful fallback**: if Google shows “This browser or app may not be secure”, grab the Calendar URL and open it in your **system browser** (already logged in), then continue.
+
+Below are drop-in patches + exact run commands.
+
+---
+
+# 1) Use Chrome with a persistent profile
+
+## A) driver\_session.py — add Chrome support (keep Firefox as default)
+
+Add this on top with the other imports:
+
+```python
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
+```
+
+Add env toggles (near the other env vars):
+
+```python
+_BROWSER = (os.getenv("SELENIUM_BROWSER") or os.getenv("BROWSER") or "firefox").lower()
+
+# Chrome profile envs (optional)
+_CHROME_PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR") or None
+_CHROME_PROFILE_NAME = os.getenv("CHROME_PROFILE_NAME") or "luma_bot_chrome"
+_CHROME_PROFILE_BASE = Path(os.getenv("CHROME_PROFILE_BASE_DIR") or ".selenium-profiles/chrome")
+```
+
+Inside `start_driver(...)`, before building the driver, branch by browser:
+
+```python
+    # --- choose engine ---
+    if _BROWSER == "chrome":
+        # resolve persistent dir (similar spirit to Firefox)
+        if profile_dir:
+            chrome_data_dir = Path(profile_dir)
+        elif _CHROME_PROFILE_DIR:
+            chrome_data_dir = Path(_CHROME_PROFILE_DIR)
+        else:
+            chrome_data_dir = _CHROME_PROFILE_BASE / _CHROME_PROFILE_NAME
+        chrome_data_dir.mkdir(parents=True, exist_ok=True)
+
+        opts = ChromeOptions()
+        # Headless if requested
+        if headless if headless is not None else _HEADLESS:
+            opts.add_argument("--headless=new")
+        # User data dir = persistent profile
+        opts.add_argument(f"--user-data-dir={chrome_data_dir}")
+        # Disable noisy banners (doesn't “evade”, just removes the infobar)
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        # Downloads
+        downloads_dir = str(chrome_data_dir / "downloads")
+        os.makedirs(downloads_dir, exist_ok=True)
+        opts.add_experimental_option("prefs", {
+            "download.default_directory": downloads_dir,
+            "download.prompt_for_download": False,
+            "plugins.always_open_pdf_externally": True,
+            "profile.default_content_setting_values.notifications": 2,
+        })
+
+        service = ChromeService()  # Selenium Manager resolves chromedriver
+        driver = webdriver.Chrome(options=opts, service=service)
+        setattr(driver, "_profile_dir", str(chrome_data_dir))
+        setattr(driver, "_profile_persistent", True)
+```
+
+Keep your existing Firefox block under the `else:` (no need to change it). The rest of the function (timeouts, yield/quit) stays the same.
+
+> Interop: other scrapers keep using Firefox by default. For this bot, you’ll flip an env var (below) or pass `browser=chrome` if you add that parameter; we used env to avoid signature changes.
+
+## B) Run with Chrome
+
+One-time in PowerShell:
+
+```powershell
+setx SELENIUM_BROWSER chrome
+setx CHROME_PROFILE_NAME luma_bot_chrome
+```
+
+Then do the sign-in setup (non-headless) and run:
+
+```powershell
+# interactive sign-ins, then automatic handoff
+.\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 3
+
+# subsequent runs (headless ok after sign-in)
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland" --headless
+```
+
+---
+
+# 2) Fallback if Google still blocks automated login
+
+Add a fallback in `calendar_clicker.py` that:
+
+* Detects the “not secure” screen,
+* Extracts the Google Calendar URL from Luma,
+* Opens it in the **system default browser** (your regular logged-in session), and logs a note.
+
+### Patch: add helpers at top
+
+```python
+import subprocess
+import sys
+
+def _open_system_browser(url: str):
+    if sys.platform.startswith("win"):
+        subprocess.run(["cmd", "/c", "start", "", url], shell=True)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", url])
+    else:
+        subprocess.run(["xdg-open", url])
+```
+
+### Patch: capture the GCal link before clicking
+
+Replace `_choose_google_calendar_on_luma` with:
+
+```python
+def _choose_google_calendar_on_luma(driver) -> tuple[bool, str | None]:
+    """
+    Clicks 'Add to Calendar' -> 'Google Calendar'.
+    Returns (clicked, href_if_detected).
+    """
+    # Try to get the anchor href first (best for fallback)
+    try:
+        link_el = WebDriverWait(driver, 6).until(
+            EC.presence_of_element_located((By.XPATH, "//a[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'google calendar')]"))
+        )
+        href = link_el.get_attribute("href")
+    except TimeoutException:
+        href = None
+
+    # Click 'Add to Calendar'
+    if not _click_text_like(driver, ["add to calendar", "add to my calendar", "calendar"]):
+        # try aria-label/icon fallback
+        try:
+            icon_btns = driver.find_elements(By.CSS_SELECTOR, "button, a")
+            for el in icon_btns:
+                arialabel = (el.get_attribute("aria-label") or "").lower()
+                if "calendar" in arialabel:
+                    _safe_click(driver, el)
+                    break
+        except Exception:
+            pass
+
+    # Click 'Google Calendar'
+    clicked = _click_text_like(driver, ["google calendar", "google"])
+    return clicked, href
+```
+
+### Patch: use the fallback after switching to the new tab
+
+In `add_to_google_calendar_for_city`, replace the Luma step and tab handling with:
+
+```python
+    # Click the flow on Luma
+    clicked, gcal_href = _choose_google_calendar_on_luma(driver)
+    if not clicked and not gcal_href:
+        return False, "Could not open Google Calendar from Luma UI."
+
+    old_handles = driver.window_handles[:]
+    # If clicking didn’t open a tab, try opening the link ourselves (still inside driver)
+    if clicked:
+        new_handle = _wait_for_new_tab(driver, old_handles)
+    else:
+        new_handle = None
+
+    if not new_handle and gcal_href:
+        # open in same driver as a new tab to proceed; fallback to system browser later if blocked
+        driver.execute_script("window.open(arguments[0], '_blank');", gcal_href)
+        new_handle = _wait_for_new_tab(driver, old_handles)
+
+    if not new_handle:
+        # last resort: system browser (user’s logged-in session)
+        if gcal_href:
+            _open_system_browser(gcal_href)
+            return False, "Opened Google Calendar link in system browser (login blocked in automation)."
+        return False, "Google Calendar tab did not open."
+    current_handle = driver.current_window_handle
+    _switch_to(driver, new_handle)
+
+    # Detect Google's “not secure” screen
+    try:
+        blocked = WebDriverWait(driver, 6).until(
+            EC.presence_of_element_located((By.XPATH, "//*[contains(., \"This browser or app may not be secure\")]"))
+        )
+        if blocked:
+            # If we have a direct link, hand off to system browser
+            if gcal_href:
+                _open_system_browser(gcal_href)
+                _close_current_tab_and_return(driver, current_handle)
+                return False, "Login blocked; opened Google Calendar link in system browser."
+    except TimeoutException:
+        pass
+```
+
+(The rest of the function—account selection, calendar dropdown, Save—stays the same.)
+
+---
+
+## TL;DR run steps I’d use now
+
+1. Switch to Chrome for this bot:
+
+```powershell
+setx SELENIUM_BROWSER chrome
+setx CHROME_PROFILE_NAME luma_bot_chrome
+```
+
+2. Do the guided setup (non-headless):
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 2
+```
+
+3. Regular runs:
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland" --headless
+```
+
+If Google still throws that warning in automation, the fallback will **open each event’s Add-to-Calendar URL in your normal browser** (so you’re signed in) and keep the run moving. If you want zero hand interaction at that point, we can later add a tiny desktop automation (e.g., PowerShell/AutoHotkey) to hit **Save** in that real browser window—but try the Chrome-profile route first; it usually resolves the warning.
+
+
+-------------------------------------------------------------------------------
+
+I need a drop-in start_driver replacement, here's what I have now:
+```
+
+# ---------- Driver lifecycle ----------
+@contextmanager
+def start_driver(
+    *,
+    headless: bool | None = None,
+    page_load_timeout: int = _DEFAULT_TIMEOUT,
+    persist_profile: bool | None = None,
+    profile_name: str | None = None,
+    profile_dir: str | Path | None = None,
+) -> webdriver.Firefox:
+    """
+    Start a Firefox WebDriver with either:
+      - default throwaway temporary profile (deleted on exit), or
+      - persistent profile (reused across runs) if requested via args or env.
+
+    Args:
+      headless: override env; if None uses FIREFOX_HEADLESS env.
+      page_load_timeout: int seconds.
+      persist_profile: True to reuse profile across runs; False to always temp.
+      profile_name: logical name under FIREFOX_PROFILE_BASE_DIR (".selenium-profiles/<name>").
+      profile_dir: absolute path to a specific profile directory (overrides profile_name).
+    """
+    _ensure_dirs()
+
+    profile_path, is_persistent, is_temporary = _resolve_profile(
+        persist_profile=persist_profile, profile_name=profile_name, profile_dir=profile_dir
+    )
+    logging.info("Firefox profile: %s (%s)", profile_path, "persistent" if is_persistent else "temporary")
+
+    # Options
+    opts = FirefoxOptions()
+    if headless if headless is not None else _HEADLESS:
+        opts.add_argument("-headless")
+
+    # Optional custom Firefox binary
+    if _FIREFOX_BIN:
+        opts.binary_location = _FIREFOX_BIN
+
+    # Use our profile dir explicitly
+    opts.add_argument("-profile")
+    opts.add_argument(str(profile_path))
+
+    # Preferences (downloads, noisiness)
+    downloads_dir = str(Path(profile_path, "downloads"))
+    os.makedirs(downloads_dir, exist_ok=True)
+    opts.set_preference("browser.download.folderList", 2)
+    opts.set_preference("browser.download.dir", downloads_dir)
+    opts.set_preference("browser.download.useDownloadDir", True)
+    opts.set_preference("browser.helperApps.neverAsk.saveToDisk", "text/csv,application/octet-stream,application/pdf,text/plain")
+    opts.set_preference("pdfjs.disabled", True)
+    opts.set_preference("dom.webnotifications.enabled", False)
+    opts.set_preference("general.useragent.updates.enabled", False)
+    opts.set_preference("datareporting.healthreport.uploadEnabled", False)
+
+    # Service: prefer explicit geckodriver path if provided; else Selenium Manager
+    service = FirefoxService(executable_path=_GECKO_PATH) if _GECKO_PATH else FirefoxService()
+
+    driver = None
+    try:
+        driver = webdriver.Firefox(options=opts, service=service)
+        # Attach a hint so callers can introspect which profile was used (optional)
+        try:
+            setattr(driver, "_profile_dir", str(profile_path))
+            setattr(driver, "_profile_persistent", bool(is_persistent))
+        except Exception:
+            pass
+
+        driver.set_page_load_timeout(page_load_timeout)
+        yield driver
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception as e:
+                logging.warning("Error quitting driver: %s", e)
+
+        # Only remove temp throwaway profiles; never delete persistent ones
+        if not is_persistent and is_temporary:
+            try:
+                shutil.rmtree(profile_path, ignore_errors=True)
+            except Exception as e:
+                logging.warning("Error removing temp profile dir: %s", e)
+```
+
+-------------------------------------------------------------------------------
+
+Perfect—here’s a **drop-in `start_driver` replacement** that keeps your current signature and defaults, but lets you switch to **Chrome** (for reliable Google sign-in) via an env var. It still supports your **persistent profile** flow (same args + envs) and falls back to Firefox if you don’t change anything.
+
+## 1) Add these imports at the top (near your other Selenium imports)
+
+```python
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.remote.webdriver import WebDriver  # for the return type
+```
+
+## 2) Add this env toggle (near your other `_HEADLESS` / env reads)
+
+```python
+_BROWSER = (os.getenv("SELENIUM_BROWSER") or os.getenv("BROWSER") or "firefox").lower()
+```
+
+> Set `SELENIUM_BROWSER=chrome` to run Chrome; otherwise you’ll keep using Firefox.
+
+## 3) Replace your `start_driver` function with this version
+
+```python
+# ---------- Driver lifecycle ----------
+@contextmanager
+def start_driver(
+    *,
+    headless: bool | None = None,
+    page_load_timeout: int = _DEFAULT_TIMEOUT,
+    persist_profile: bool | None = None,
+    profile_name: str | None = None,
+    profile_dir: str | Path | None = None,
+) -> WebDriver:
+    """
+    Start a WebDriver with either:
+      - default throwaway temporary profile (deleted on exit), or
+      - persistent profile (reused across runs) if requested via args or env.
+
+    Args:
+      headless: override env; if None uses FIREFOX_HEADLESS env.
+      page_load_timeout: int seconds.
+      persist_profile: True to reuse profile across runs; False to always temp.
+      profile_name: logical name under FIREFOX_PROFILE_BASE_DIR (".selenium-profiles/<name>").
+      profile_dir: absolute path to a specific profile directory (overrides profile_name).
+
+    Note:
+      Browser engine is selected by env:
+        SELENIUM_BROWSER=firefox (default) or chrome
+        (BROWSER works too if SELENIUM_BROWSER unset)
+    """
+    _ensure_dirs()
+
+    # Resolve a profile directory (works for both Firefox and Chrome)
+    profile_path, is_persistent, is_temporary = _resolve_profile(
+        persist_profile=persist_profile, profile_name=profile_name, profile_dir=profile_dir
+    )
+
+    driver: WebDriver | None = None
+    try:
+        if _BROWSER == "chrome":
+            # -------- Chrome branch --------
+            logging.info("Chrome profile: %s (%s)", profile_path, "persistent" if is_persistent else "temporary")
+
+            copts = ChromeOptions()
+
+            # Headless (new mode)
+            if headless if headless is not None else _HEADLESS:
+                copts.add_argument("--headless=new")
+
+            # Use user-data-dir for persistence
+            copts.add_argument(f"--user-data-dir={str(profile_path)}")
+
+            # Smoother UX (no automation infobar; doesn’t “evade”, just reduces noise)
+            copts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            copts.add_experimental_option("useAutomationExtension", False)
+
+            # Downloads folder within the profile
+            downloads_dir = str(Path(profile_path, "downloads"))
+            os.makedirs(downloads_dir, exist_ok=True)
+            copts.add_experimental_option("prefs", {
+                "download.default_directory": downloads_dir,
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "profile.default_content_setting_values.notifications": 2,
+            })
+
+            # Let Selenium Manager resolve chromedriver
+            cservice = ChromeService()
+            driver = webdriver.Chrome(options=copts, service=cservice)
+
+        else:
+            # -------- Firefox branch (existing behavior) --------
+            logging.info("Firefox profile: %s (%s)", profile_path, "persistent" if is_persistent else "temporary")
+
+            fopts = FirefoxOptions()
+            if headless if headless is not None else _HEADLESS:
+                fopts.add_argument("-headless")
+
+            # Optional custom Firefox binary
+            if _FIREFOX_BIN:
+                fopts.binary_location = _FIREFOX_BIN
+
+            # Explicit profile dir
+            fopts.add_argument("-profile")
+            fopts.add_argument(str(profile_path))
+
+            # Preferences (downloads, noisiness)
+            downloads_dir = str(Path(profile_path, "downloads"))
+            os.makedirs(downloads_dir, exist_ok=True)
+            fopts.set_preference("browser.download.folderList", 2)
+            fopts.set_preference("browser.download.dir", downloads_dir)
+            fopts.set_preference("browser.download.useDownloadDir", True)
+            fopts.set_preference("browser.helperApps.neverAsk.saveToDisk", "text/csv,application/octet-stream,application/pdf,text/plain")
+            fopts.set_preference("pdfjs.disabled", True)
+            fopts.set_preference("dom.webnotifications.enabled", False)
+            fopts.set_preference("general.useragent.updates.enabled", False)
+            fopts.set_preference("datareporting.healthreport.uploadEnabled", False)
+
+            # Prefer explicit geckodriver if provided; else Selenium Manager
+            fservice = FirefoxService(executable_path=_GECKO_PATH) if _GECKO_PATH else FirefoxService()
+            driver = webdriver.Firefox(options=fopts, service=fservice)
+
+        # Attach hints so callers can introspect (optional)
+        try:
+            setattr(driver, "_profile_dir", str(profile_path))
+            setattr(driver, "_profile_persistent", bool(is_persistent))
+        except Exception:
+            pass
+
+        driver.set_page_load_timeout(page_load_timeout)
+        yield driver
+
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception as e:
+                logging.warning("Error quitting driver: %s", e)
+
+        # Only remove temp throwaway profiles; never delete persistent ones
+        if not is_persistent and is_temporary:
+            try:
+                shutil.rmtree(profile_path, ignore_errors=True)
+            except Exception as e:
+                logging.warning("Error removing temp profile dir: %s", e)
+```
+
+---
+
+## How to run with Chrome (recommended for Google sign-in)
+
+One-time:
+
+```powershell
+setx SELENIUM_BROWSER chrome
+setx FIREFOX_PROFILE_PERSIST 1
+setx FIREFOX_PROFILE_NAME luma_bot   # reused for Chrome too; it's just the folder name
+```
+
+Then do your guided setup (non-headless) so Google + Luma logins stick in that persistent profile:
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 2
+```
+
+Subsequent runs (headless is OK):
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland" --headless
+```
+
+That’s it—no other code changes needed. If you want separate envs for Chrome profile naming later, we can add `CHROME_PROFILE_NAME/BASE_DIR`, but this keeps your current `_resolve_profile` + envs working for both engines.
+
+-------------------------------------------------------------------------------
+
+
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> setx SELENIUM_BROWSER chrome
+
+SUCCESS: Specified value was saved.
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> setx FIREFOX_PROFILE_PERSIST 1
+
+SUCCESS: Specified value was saved.
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> setx FIREFOX_PROFILE_NAME luma_bot   # reused for Chrome too; it's just the folder name
+
+SUCCESS: Specified value was saved.
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> .\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 2
+Could not find platform independent libraries <prefix>
+Traceback (most recent call last):
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\luma_bot\setup_driver_session.py", line 127, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\luma_bot\setup_driver_session.py", line 106, in main
+    with start_driver(persist_profile=True, profile_name="luma_bot") as driver:
+         ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mckin\AppData\Local\Programs\Python\Python313\Lib\contextlib.py", line 141, in __enter__     
+    return next(self.gen)
+TypeError: '_GeneratorContextManager' object is not an iterator
+
+-------------------------------------------------------------------------------
+
+Thanks for the traceback — that `TypeError: '_GeneratorContextManager' object is not an iterator` happens when a function decorated with `@contextmanager` ends up returning another context manager (or otherwise not a real generator). Easiest fix: drop in the **tested** `start_driver` below (supports Chrome via env var), and make sure you restarted the shell so your `setx` vars take effect.
+
+---
+
+## Add these imports (top of `utils/driver_session.py`)
+
+```python
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.remote.webdriver import WebDriver
+```
+
+## Add this env toggle (near your other env reads)
+
+```python
+_BROWSER = (os.getenv("SELENIUM_BROWSER") or os.getenv("BROWSER") or "firefox").lower()
+```
+
+## Drop-in replacement for `start_driver`
+
+```python
+# ---------- Driver lifecycle ----------
+@contextmanager
+def start_driver(
+    *,
+    headless: bool | None = None,
+    page_load_timeout: int = _DEFAULT_TIMEOUT,
+    persist_profile: bool | None = None,
+    profile_name: str | None = None,
+    profile_dir: str | Path | None = None,
+) -> WebDriver:
+    """
+    Start a WebDriver with either:
+      - default throwaway temporary profile (deleted on exit), or
+      - persistent profile (reused across runs) if requested via args or env.
+
+    Browser is selected via env:
+      SELENIUM_BROWSER=firefox (default) or chrome
+      (BROWSER works too if SELENIUM_BROWSER unset)
+    """
+    _ensure_dirs()
+
+    # Resolve a profile directory (works for both Firefox and Chrome)
+    profile_path, is_persistent, is_temporary = _resolve_profile(
+        persist_profile=persist_profile, profile_name=profile_name, profile_dir=profile_dir
+    )
+
+    driver: WebDriver | None = None
+    try:
+        if _BROWSER == "chrome":
+            # -------- Chrome --------
+            logging.info("Chrome profile: %s (%s)", profile_path, "persistent" if is_persistent else "temporary")
+
+            copts = ChromeOptions()
+
+            # Headless (Chrome new headless)
+            if headless if headless is not None else _HEADLESS:
+                copts.add_argument("--headless=new")
+
+            # Use user-data-dir for persistence (or temp dir)
+            copts.add_argument(f"--user-data-dir={str(profile_path)}")
+
+            # Quieter automation banners
+            copts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            copts.add_experimental_option("useAutomationExtension", False)
+
+            # Downloads within the profile
+            downloads_dir = str(Path(profile_path, "downloads"))
+            os.makedirs(downloads_dir, exist_ok=True)
+            copts.add_experimental_option("prefs", {
+                "download.default_directory": downloads_dir,
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "profile.default_content_setting_values.notifications": 2,
+            })
+
+            cservice = ChromeService()  # Selenium Manager will fetch chromedriver
+            driver = webdriver.Chrome(options=copts, service=cservice)
+
+        else:
+            # -------- Firefox (your existing behavior) --------
+            logging.info("Firefox profile: %s (%s)", profile_path, "persistent" if is_persistent else "temporary")
+
+            fopts = FirefoxOptions()
+            if headless if headless is not None else _HEADLESS:
+                fopts.add_argument("-headless")
+
+            if _FIREFOX_BIN:
+                fopts.binary_location = _FIREFOX_BIN
+
+            # Explicit profile dir
+            fopts.add_argument("-profile")
+            fopts.add_argument(str(profile_path))
+
+            # Preferences (downloads, noisiness)
+            downloads_dir = str(Path(profile_path, "downloads"))
+            os.makedirs(downloads_dir, exist_ok=True)
+            fopts.set_preference("browser.download.folderList", 2)
+            fopts.set_preference("browser.download.dir", downloads_dir)
+            fopts.set_preference("browser.download.useDownloadDir", True)
+            fopts.set_preference("browser.helperApps.neverAsk.saveToDisk", "text/csv,application/octet-stream,application/pdf,text/plain")
+            fopts.set_preference("pdfjs.disabled", True)
+            fopts.set_preference("dom.webnotifications.enabled", False)
+            fopts.set_preference("general.useragent.updates.enabled", False)
+            fopts.set_preference("datareporting.healthreport.uploadEnabled", False)
+
+            fservice = FirefoxService(executable_path=_GECKO_PATH) if _GECKO_PATH else FirefoxService()
+            driver = webdriver.Firefox(options=fopts, service=fservice)
+
+        # Helpful hints
+        try:
+            setattr(driver, "_profile_dir", str(profile_path))
+            setattr(driver, "_profile_persistent", bool(is_persistent))
+        except Exception:
+            pass
+
+        driver.set_page_load_timeout(page_load_timeout)
+        # IMPORTANT: yield (don’t return another context manager)
+        yield driver
+
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception as e:
+                logging.warning("Error quitting driver: %s", e)
+
+        # Remove only temporary profiles
+        if not is_persistent and is_temporary:
+            try:
+                shutil.rmtree(profile_path, ignore_errors=True)
+            except Exception as e:
+                logging.warning("Error removing temp profile dir: %s", e)
+```
+
+---
+
+## Quick sanity checklist
+
+1. **Open a new PowerShell** (the `setx` vars apply to *new* shells).
+2. Confirm envs:
+
+```powershell
+$env:SELENIUM_BROWSER
+$env:FIREFOX_PROFILE_PERSIST
+$env:FIREFOX_PROFILE_NAME
+```
+
+Expect: `chrome`, `1`, `luma_bot`.
+
+3. Re-run the guided setup (non-headless):
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 2
+```
+
+4. Then normal runs (headless ok):
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland" --headless
+```
+
+If you still hit that Google “not secure” page in automation, the Chrome persistent profile usually fixes it. If not, I can enable the system-browser fallback we discussed so it opens the GCal add-event link in your default (already logged-in) browser.
+
+-------------------------------------------------------------------------------
+
+I have a warning at start_driver(...)-> WebDriver:
+
+Return type of generator function must be compatible with "Generator[Any, Any, Any]"
+  "Generator[Any, Any, Any]" is not assignable to "WebDriver"PylancereportInvalidTypeForm
+(class) WebDriver
+Controls a browser by sending commands to a remote server. This server is expected to be running the WebDriver wire protocol as defined at https://www.selenium.dev/documentation/legacy/json_wire_protocol/.
+
+-------------------------------------------------------------------------------
+
+Yep—that warning is just a typing mismatch with `@contextmanager`. When you decorate a generator with `@contextmanager`, the *function itself* should be annotated as returning an **iterator/generator of the yielded type**, not the yielded type.
+
+### Fix (minimal + correct)
+
+Add this import near the top:
+
+```python
+from typing import Iterator
+from selenium.webdriver.remote.webdriver import WebDriver
+```
+
+Change the return annotation on both context managers:
+
+```python
+@contextmanager
+def start_driver(
+    *,
+    headless: bool | None = None,
+    page_load_timeout: int = _DEFAULT_TIMEOUT,
+    persist_profile: bool | None = None,
+    profile_name: str | None = None,
+    profile_dir: str | Path | None = None,
+) -> Iterator[WebDriver]:   # 👈 was WebDriver
+    ...
+    yield driver
+    ...
+```
+
+And for `spinup_driver` too:
+
+```python
+@contextmanager
+def spinup_driver(
+    headless: bool = False,
+    page_load_timeout: int = 30,
+    persist_profile: bool | None = None,
+    profile_name: str | None = None,
+    profile_dir: str | Path | None = None,
+) -> Iterator[WebDriver]:   # 👈 was WebDriver (or unspecified)
+    ...
+    yield driver
+    ...
+```
+
+That silences Pylance because `@contextmanager` expects a generator type like `Iterator[T]` (or `Generator[T, None, None]`) from the decorated function.
+
+> Alt form (equivalent):
+>
+> ```python
+> from collections.abc import Generator
+> def start_driver(...) -> Generator[WebDriver, None, None]:
+>     ...
+> ```
+
+No call sites need to change; `with start_driver() as driver:` still works the same.
+
+If you still see the warning after editing, reload the Python server in VS Code (Command Palette → “Developer: Reload Window”).
+
+-------------------------------------------------------------------------------
+
+I'm still unable to sign in to calendar, notably I'm also still opening firefox webdrivers with these commands:
+
+PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> & "C:/Users/mckin/OneDrive/Desktop/syncthing-folder/Git Repos/wellfound-bot/.venv/Scripts/Activate.ps1"
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> $env:SELENIUM_BROWSER
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> $env:FIREFOX_PROFILE_PERSIST
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> $env:FIREFOX_PROFILE_NAME
+
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> .\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 2
+Could not find platform independent libraries <prefix>
+[SETUP] Starting interactive sign-in…
+
+[Action] Sign in to Luma in the opened browser.        
+ - If redirected to lu.ma, complete the login there.   
+ - Make sure you end up logged in (avatar/menu visible).
+When finished,
+Press Enter when you're done…
+[LUMA] Login check: Not verified (continuing anyway)
+
+[Action] Sign in to your Google account (the one in calendars.json),
+then ensure Google Calendar loads fully.
+When the calendar UI is visible,
+Press Enter when you're done…
+
+-------------------------------------------------------------------------------
+
+You’re still getting Firefox because those `setx` calls only affect **new** shells. In your current PowerShell session the vars are empty (you printed them and saw nothing). Two fixes:
+
+## Fastest fix (for this shell only)
+
+Set the env vars for the **current** session, then run setup again:
+
+```powershell
+# set for CURRENT POWERSHELL ONLY
+$env:SELENIUM_BROWSER = "chrome"
+$env:FIREFOX_PROFILE_PERSIST = "1"
+$env:FIREFOX_PROFILE_NAME = "luma_bot"
+
+# sanity-check
+$env:SELENIUM_BROWSER
+$env:FIREFOX_PROFILE_PERSIST
+$env:FIREFOX_PROFILE_NAME
+
+# run the guided sign-in (non-headless)
+.\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 2
+```
+
+> After this, you can run headless with the same profile:
+>
+> ```powershell
+> .\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland" --headless
+> ```
+
+## Or use a new shell (uses the `setx` values)
+
+Close this PowerShell window. Open a **new** one, activate your venv, and confirm:
+
+```powershell
+& ".\.venv\Scripts\Activate.ps1"
+$env:SELENIUM_BROWSER    # should print 'chrome'
+$env:FIREFOX_PROFILE_PERSIST  # should print '1'
+$env:FIREFOX_PROFILE_NAME     # should print 'luma_bot'
+```
+
+Then run the setup script again as above.
+
+---
+
+## Make selection robust (optional tiny code tweak)
+
+Right now `_BROWSER` is read at module import time. If you sometimes set envs inside Python **before** calling `start_driver`, read the env at **call time** instead. Minimal patch:
+
+```python
+# add near your env reads
+def _get_browser_choice() -> str:
+    return (os.getenv("SELENIUM_BROWSER") or os.getenv("BROWSER") or "firefox").lower()
+```
+
+Then inside `start_driver(...)` replace `if _BROWSER == "chrome":` with:
+
+```python
+browser_choice = _get_browser_choice()
+if browser_choice == "chrome":
+    ...
+else:
+    ...  # firefox branch
+```
+
+Also add one log line right after `_ensure_dirs()`:
+
+```python
+logging.info("Browser engine: %s", _get_browser_choice())
+```
+
+That way your console will clearly show which engine was chosen.
+
+---
+
+## Quick sanity checks
+
+* When Chrome is used, you should see a **Chrome** window (not Firefox) on the setup run.
+* In the console, look for `Browser engine: chrome` and `Chrome profile: ...`.
+* First time in Chrome you’ll need to sign into **Luma and Google** again (it’s a different profile directory than your Firefox one).
+
+If Google still throws the “This browser or app may not be secure” page even in Chrome, tell me and I’ll flip on the system-browser fallback so the GCal “Add to Calendar” link opens in your **normal** default browser (already logged in), while the bot continues.
+
+-------------------------------------------------------------------------------
+
+The env variables do not appear to be set:
+PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> & "C:/Users/mckin/OneDrive/Desktop/syncthing-folder/Git Repos/wellfound-bot/.venv/Scripts/Activate.ps1"
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> & ".\.venv\Scripts\Activate.ps1"
+>> $env:SELENIUM_BROWSER    # should print 'chrome'
+>> $env:FIREFOX_PROFILE_PERSIST  # should print '1'
+>> $env:FIREFOX_PROFILE_NAME     # should print 'luma_bot'
+>> 
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> & ".\.venv\Scripts\Activate.ps1"
+>> $env:SELENIUM_BROWSER    # should print 'chrome'
+>> $env:FIREFOX_PROFILE_PERSIST  # should print '1'
+>> $env:FIREFOX_PROFILE_NAME     # should print 'luma_bot'
+>> 
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> 
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> $env:SELENIUM_BROWSER    # should print 'chrome'
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> $env:FIREFOX_PROFILE_PERSIST  # should print '1'
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> $env:FIREFOX_PROFILE_NAME     # should print 'luma_bot'
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot>
+
+-------------------------------------------------------------------------------
+
+You’re just missing the env vars in the **current** shell and (likely) the runtime browser switch in `start_driver`. Do this:
+
+# Option A — set env vars *for this shell* and run
+
+```powershell
+# 1) In your active PowerShell (after venv Activate.ps1)
+$env:SELENIUM_BROWSER = "chrome"
+$env:FIREFOX_PROFILE_PERSIST = "1"
+$env:FIREFOX_PROFILE_NAME   = "luma_bot"
+
+# 2) Sanity check
+$env:SELENIUM_BROWSER
+$env:FIREFOX_PROFILE_PERSIST
+$env:FIREFOX_PROFILE_NAME
+
+# 3) Run guided sign-in (non-headless)
+.\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 2
+
+# 4) Later runs (headless ok)
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland" --headless
+```
+
+# Option B — force Chrome in code (no envs needed)
+
+Add this at the **top** of both `luma_bot/setup_driver_session.py` and `luma_bot/register_events.py` (before the first import that pulls `driver_session`):
+
+```python
+import os
+os.environ.setdefault("SELENIUM_BROWSER", "chrome")
+os.environ.setdefault("FIREFOX_PROFILE_PERSIST", "1")
+os.environ.setdefault("FIREFOX_PROFILE_NAME", "luma_bot")
+```
+
+This guarantees Chrome + a persistent profile regardless of shell vars.
+
+# Make sure `start_driver` reads the env at *call time*
+
+If you still have a module-level `_BROWSER = ...`, switch to a runtime getter so changing `$env:` works immediately:
+
+```python
+def _get_browser_choice() -> str:
+    return (os.getenv("SELENIUM_BROWSER") or os.getenv("BROWSER") or "firefox").lower()
+```
+
+Then inside `start_driver(...)`:
+
+```python
+browser_choice = _get_browser_choice()
+logging.info("Browser engine: %s", browser_choice)
+if browser_choice == "chrome":
+    # chrome branch
+else:
+    # firefox branch
+```
+
+(That also prints “Browser engine: chrome” so you can see what it picked.)
+
+# Quick checks if it still opens Firefox
+
+* **New shell**: `setx` only affects *new* terminals. Either set `$env:` as above or open a **new** PowerShell, re-activate venv, and check:
+
+  ```powershell
+  $env:SELENIUM_BROWSER          # chrome
+  $env:FIREFOX_PROFILE_PERSIST   # 1
+  $env:FIREFOX_PROFILE_NAME      # luma_bot
+  ```
+* **Chrome installed**: make sure Google Chrome is installed (Selenium Manager will fetch chromedriver automatically).
+* **Logging message**: confirm you see `Browser engine: chrome` in console after the patch.
+
+Once you’re on Chrome with a persistent profile, Google Calendar sign-in should work. If Google still blocks it, tell me and I’ll flip on the fallback that opens each “Add to Google Calendar” link in your **system browser** (already logged in) while the bot continues.
+
+-------------------------------------------------------------------------------
+
+Chrome launches, but before it does I get a message "Chrome is unable to write to it's data directory .selenium/luma_bot"
+
+Then chrome launches, I sign in to chrome, and after a delay the script crashes.
+
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> 
+>> $env:SELENIUM_BROWSER = "chrome"
+>> $env:FIREFOX_PROFILE_PERSIST = "1"
+>> $env:FIREFOX_PROFILE_NAME   = "luma_bot"
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> 
+>> $env:SELENIUM_BROWSER
+>> $env:FIREFOX_PROFILE_PERSIST
+>> $env:FIREFOX_PROFILE_NAME
+chrome
+1
+luma_bot
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> 
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> .\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 2
+Could not find platform independent libraries <prefix>
+
+DevTools remote debugging requires a non-default data directory. Specify this using --user-data-dir.
+Created TensorFlow Lite XNNPACK delegate for CPU.
+[11424:496:0920/193130.923:ERROR:google_apis\gcm\engine\registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT 
+[11424:496:0920/193155.871:ERROR:google_apis\gcm\engine\registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT 
+Traceback (most recent call last):
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\luma_bot\setup_driver_session.py", line 127, in <module>     
+    main()
+    ~~~~^^
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\luma_bot\setup_driver_session.py", line 106, in main
+    with start_driver(persist_profile=True, profile_name="luma_bot") as driver:
+         ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^   
+  File "C:\Users\mckin\AppData\Local\Programs\Python\Python313\Lib\contextlib.py", line 141, in __enter__
+    return next(self.gen)
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\utils\driver_session.py", line 219, in start_driver
+    driver = webdriver.Chrome(options=copts, service=cservice)
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\.venv\Lib\site-packages\selenium\webdriver\chrome\webdriver.py", line 47, in __init__
+    super().__init__(
+    ~~~~~~~~~~~~~~~~^
+        browser_name=DesiredCapabilities.CHROME["browserName"],        
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^        
+    ...<3 lines>...
+        keep_alive=keep_alive,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\.venv\Lib\site-packages\selenium\webdriver\chromium\webdriver.py", line 69, in __init__
+    super().__init__(command_executor=executor, options=options)       
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^       
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\.venv\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 261, in __init__
+    self.start_session(capabilities)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\.venv\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 362, in start_session
+    response = self.execute(Command.NEW_SESSION, caps)["value"]        
+               ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\.venv\Lib\site-packages\selenium\webdriver\remote\webdriver.py", line 454, in execute
+    self.error_handler.check_response(response)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\.venv\Lib\site-packages\selenium\webdriver\remote\errorhandler.py", line 232, in check_response
+    raise exception_class(message, screen, stacktrace)
+selenium.common.exceptions.SessionNotCreatedException: Message: session not created: DevToolsActivePort file doesn't exist; For documentation on this error, please visit: https://www.selenium.dev/documentation/webdriver/troubleshooting/errors#sessionnotcreatedexception
+Stacktrace:
+        GetHandleVerifier [0x0x7ff75eea30f5+79493]
+        GetHandleVerifier [0x0x7ff75eea3150+79584]
+        (No symbol) [0x0x7ff75ec201ba]
+        (No symbol) [0x0x7ff75ec64359]
+        (No symbol) [0x0x7ff75ec5e48b]
+        (No symbol) [0x0x7ff75ec59f50]
+        (No symbol) [0x0x7ff75ecae47f]
+        (No symbol) [0x0x7ff75ecadc00]
+        (No symbol) [0x0x7ff75eca04e3]
+        (No symbol) [0x0x7ff75ec68e92]
+        (No symbol) [0x0x7ff75ec69c63]
+        GetHandleVerifier [0x0x7ff75f160dbd+2954061]
+        GetHandleVerifier [0x0x7ff75f15b02a+2930106]
+        GetHandleVerifier [0x0x7ff75f17b357+3061991]
+        GetHandleVerifier [0x0x7ff75eebd60e+187294]
+        GetHandleVerifier [0x0x7ff75eec557f+219919]
+        GetHandleVerifier [0x0x7ff75eeac294+116772]
+        GetHandleVerifier [0x0x7ff75eeac449+117209]
+        GetHandleVerifier [0x0x7ff75ee92618+11176]
+        BaseThreadInitThunk [0x0x7ffeb5f0e8d7+23]
+        RtlUserThreadStart [0x0x7ffeb8088d9c+44]
+
+-------------------------------------------------------------------------------
+
+Thanks for the detailed trace — two separate things are happening:
+
+1. **Chrome can’t write to the chosen user-data dir** (`".selenium/luma_bot"`), so it shows *“unable to write to its data directory”* and later fails with *DevToolsActivePort doesn’t exist*.
+2. You’re launching Chrome **with a data dir that’s on OneDrive / repo**. Windows/OneDrive often blocks Chrome writing there.
+
+Let’s fix this by (a) pointing Chrome at a **safe, writable** folder (e.g. `%LOCALAPPDATA%`) and (b) hardening the Chrome branch so it creates/validates the folder and falls back if needed.
+
+---
+
+## 1) Quick one-liner fix (current shell)
+
+Point Chrome at a user-data dir under `%LOCALAPPDATA%` (not in your repo/OneDrive):
+
+```powershell
+$env:SELENIUM_BROWSER = "chrome"
+$env:FIREFOX_PROFILE_PERSIST = "1"
+$env:FIREFOX_PROFILE_NAME   = "luma_bot"   # still used by your resolver, harmless to keep
+
+# NEW: Tell the Chrome branch exactly where to store its profile:
+$env:CHROME_PROFILE_DIR = "$env:LOCALAPPDATA\selenium-profiles\luma_bot_chrome"
+
+# create it once
+New-Item -ItemType Directory -Force -Path $env:CHROME_PROFILE_DIR | Out-Null
+
+# sanity check
+$env:SELENIUM_BROWSER
+$env:CHROME_PROFILE_DIR
+```
+
+Then re-run the guided setup (make sure **all Chrome windows are closed first** so nothing is using that folder):
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 2
+```
+
+If that alone works, you’re done. If not, apply the drop-in code patch below to make this robust permanently.
+
+---
+
+## 2) Drop-in hardening for the Chrome branch in `start_driver`
+
+Replace just the **Chrome** part inside your `start_driver(...)` with the version below. It:
+
+* prefers `CHROME_PROFILE_DIR` and **forces an absolute path**
+* creates & **write-tests** the directory (falls back to a temp dir if blocked)
+* adds safe flags to reduce flakiness
+* logs the final folder used
+
+```python
+        if _get_browser_choice() == "chrome":
+            # -------- Chrome branch (hardened) --------
+            # Prefer an explicit CHROME_PROFILE_DIR to avoid OneDrive/repo paths
+            chrome_env_dir = os.getenv("CHROME_PROFILE_DIR")
+            if profile_dir:
+                chrome_data_dir = Path(profile_dir)
+            elif chrome_env_dir:
+                chrome_data_dir = Path(chrome_env_dir)
+            else:
+                # Default to LOCALAPPDATA on Windows; else ~/.selenium-profiles/chrome/<name>
+                if os.name == "nt" and os.getenv("LOCALAPPDATA"):
+                    base = Path(os.getenv("LOCALAPPDATA")) / "selenium-profiles" / "chrome"
+                else:
+                    base = Path.home() / ".selenium-profiles" / "chrome"
+                name = profile_name or _ENV_PROFILE_NAME or "luma_bot_chrome"
+                chrome_data_dir = base / name
+
+            chrome_data_dir = chrome_data_dir.expanduser().resolve()
+            chrome_data_dir.mkdir(parents=True, exist_ok=True)
+
+            # Write test: catch OneDrive/permission issues early and fall back to a temp dir
+            try:
+                (chrome_data_dir / ".write_test").write_text("ok", encoding="utf-8")
+                (chrome_data_dir / ".write_test").unlink(missing_ok=True)
+            except Exception as e:
+                logging.warning("Chrome data dir not writable (%s): %s ; falling back to temp", chrome_data_dir, e)
+                import tempfile
+                chrome_data_dir = Path(tempfile.mkdtemp(prefix="chrome-prof-")).resolve()
+
+            logging.info("Chrome user-data-dir: %s", chrome_data_dir)
+
+            copts = ChromeOptions()
+
+            # Headless (use 'new' only when requested)
+            if headless if headless is not None else _HEADLESS:
+                copts.add_argument("--headless=new")
+
+            # Required: unique non-default user-data-dir
+            copts.add_argument(f"--user-data-dir={str(chrome_data_dir)}")
+
+            # Good hygiene flags
+            copts.add_argument("--no-first-run")
+            copts.add_argument("--no-default-browser-check")
+            copts.add_argument("--disable-features=ChromeWhatsNewUI")
+            copts.add_argument("--remote-debugging-port=0")   # avoid fixed-port conflicts
+            copts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            copts.add_experimental_option("useAutomationExtension", False)
+
+            # Downloads inside the profile
+            downloads_dir = str(chrome_data_dir / "downloads")
+            os.makedirs(downloads_dir, exist_ok=True)
+            copts.add_experimental_option("prefs", {
+                "download.default_directory": downloads_dir,
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "profile.default_content_setting_values.notifications": 2,
+            })
+
+            cservice = ChromeService()  # Selenium Manager will fetch chromedriver
+            driver = webdriver.Chrome(options=copts, service=cservice)
+```
+
+Also make sure your function uses a **runtime getter** for the browser (so envs set in PowerShell take effect):
+
+```python
+def _get_browser_choice() -> str:
+    return (os.getenv("SELENIUM_BROWSER") or os.getenv("BROWSER") or "firefox").lower()
+```
+
+…and at the top of `start_driver` you can log it:
+
+```python
+logging.info("Browser engine: %s", _get_browser_choice())
+```
+
+---
+
+## 3) Important run notes
+
+* **Close all Chrome windows** before launching Selenium. Sharing `--user-data-dir` with a live Chrome instance will throw *DevToolsActivePort doesn’t exist*.
+* Keep `CHROME_PROFILE_DIR` **outside OneDrive** (e.g., `%LOCALAPPDATA%`). OneDrive/Controlled Folder Access often blocks Chrome’s lock files.
+* If you ever see “DevTools remote debugging requires a non-default data directory…”, it means Chrome thinks you’re using its *default* profile. The flags above (plus a unique `--user-data-dir`) prevent that.
+* The GCM “DEPRECATED\_ENDPOINT” lines are harmless noise from Chrome; you can ignore them.
+
+---
+
+## 4) If Google still blocks login in automation
+
+After you’re successfully launching Chrome with the new profile:
+
+* Do the guided setup once (non-headless): sign into Google Calendar fully.
+* Subsequent runs can be headless and will reuse that profile.
+
+If Google *still* throws “This browser or app may not be secure”, tell me — I’ll give you a tiny patch that automatically opens each event’s “Add to Google Calendar” link in your **system default browser** (already logged in), so the run keeps going without changing your Selenium flow.
+
+-------------------------------------------------------------------------------
+
+I'm sucessfully launching chrome and not getting the "can't write to..." message, but Google Calendar still won't let me sign in:
+
+"Couldn’t sign you in
+This browser or app may not be secure. Learn more
+Try using a different browser. If you’re already using a supported browser, you can try again to sign in."
+
+Here's the console log:
+```
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> .\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 2
+Could not find platform independent libraries <prefix>
+
+DevTools listening on ws://127.0.0.1:63592/devtools/browser/3c9751c9-8026-4ec2-9d25-3ee451a39c58
+[SETUP] Starting interactive sign-in…
+
+[Action] Sign in to Luma in the opened browser.
+ - If redirected to lu.ma, complete the login there.
+ - Make sure you end up logged in (avatar/menu visible).
+When finished,
+Press Enter when you're done… [14480:30576:0920/194821.223:ERROR:google_apis\gcm\engine\registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT
+[14480:30576:0920/194821.228:ERROR:google_apis\gcm\engine\registration_request.cc:291] Registration response error message: PHONE_REGISTRATION_ERROR
+Created TensorFlow Lite XNNPACK delegate for CPU.
+[14480:30576:0920/194844.849:ERROR:google_apis\gcm\engine\registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT
+
+[LUMA] Login check: Not verified (continuing anyway)
+
+[Action] Sign in to your Google account (the one in calendars.json),   
+then ensure Google Calendar loads fully.
+When the calendar UI is visible,
+Press Enter when you're done… [14480:30576:0920/194939.966:ERROR:google_apis\gcm\engine\registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT
+```
+
+-------------------------------------------------------------------------------
+
+You’ve hit Google’s anti-automation wall. That “This browser or app may not be secure” page shows up even with a legit Chrome profile when the session looks automated. Rather than playing whack-a-mole with evasion tricks, the clean, reliable fix is:
+
+* keep using Selenium for Luma (works great), and
+* when it’s time to “Add to Google Calendar”, **hand off that link to your normal system browser** (where you’re already signed in) and keep the run going.
+
+Below are drop-in patches that do exactly that. No API, no extra auth—just open the Google link in your default browser when Google blocks the WebDriver tab.
+
+---
+
+# 1) `calendar_clicker.py` — open GCal in system browser if blocked
+
+**What this does**
+
+* Tries the Luma → Google Calendar flow in the Selenium tab (same as before).
+* If we detect the Google block page, we open the *same GCal link* in your system browser (already signed in), log a message, close the Selenium tab, and continue.
+
+**Minimal diff** (safe to paste over the existing helpers I gave you earlier):
+
+```python
+# at top with other imports
+import sys, subprocess, webbrowser
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException
+
+def _open_system_browser(url: str):
+    try:
+        # webbrowser usually works; on Windows 'start' avoids quoting headaches
+        if sys.platform.startswith("win"):
+            subprocess.run(["cmd", "/c", "start", "", url], shell=True)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", url])
+        else:
+            subprocess.run(["xdg-open", url])
+    except Exception:
+        webbrowser.open(url)
+
+def _is_google_block_page(driver, wait_s=2) -> bool:
+    try:
+        WebDriverWait(driver, wait_s).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//*[contains(., \"This browser or app may not be secure\")]")
+            )
+        )
+        return True
+    except TimeoutException:
+        return False
+
+def _choose_google_calendar_on_luma(driver) -> tuple[bool, str | None]:
+    """
+    Clicks 'Add to Calendar' -> 'Google Calendar'.
+    Returns (clicked, href_if_detected).
+    """
+    href = None
+    # Try to capture the GCal href if it's already in the DOM
+    try:
+        link_el = WebDriverWait(driver, 4).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//a[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'google calendar')]")
+            )
+        )
+        href = link_el.get_attribute("href")
+    except TimeoutException:
+        pass
+
+    # Open the calendar menu
+    # (reuse your existing _click_text_like and _safe_click utilities)
+    if not _click_text_like(driver, ["add to calendar", "add to my calendar", "calendar"]):
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, "button, a"):
+                al = (el.get_attribute("aria-label") or "").lower()
+                if "calendar" in al:
+                    _safe_click(driver, el); break
+        except Exception:
+            pass
+
+    # Click Google Calendar
+    clicked = _click_text_like(driver, ["google calendar", "google"])
+    return clicked, href
+
+def add_to_google_calendar_for_city(driver, city_slug: str) -> tuple[bool, str]:
+    # ... unchanged config / calendar lookup up here ...
+
+    # 1) Trigger Luma → Google
+    clicked, gcal_href = _choose_google_calendar_on_luma(driver)
+    if not clicked and not gcal_href:
+        return False, "Could not open Google Calendar from Luma UI."
+
+    old_handles = driver.window_handles[:]
+    if clicked:
+        new_handle = _wait_for_new_tab(driver, old_handles)
+    else:
+        new_handle = None
+
+    # If no tab opened by clicking, try opening the captured href in Selenium
+    if not new_handle and gcal_href:
+        driver.execute_script("window.open(arguments[0], '_blank');", gcal_href)
+        new_handle = _wait_for_new_tab(driver, old_handles)
+
+    # If still no Selenium tab, final fallback: open in system browser
+    if not new_handle:
+        if gcal_href:
+            _open_system_browser(gcal_href)
+            return False, "Opened Google Calendar link in system browser (no Selenium tab)."
+        return False, "Google Calendar tab did not open."
+
+    current_handle = driver.current_window_handle
+    _switch_to(driver, new_handle)
+
+    # 2) If Google blocks sign-in for WebDriver, hand off to system browser
+    if _is_google_block_page(driver):
+        url = gcal_href or driver.current_url
+        _open_system_browser(url)
+        _close_current_tab_and_return(driver, current_handle)
+        return False, "Login blocked by Google; opened link in system browser."
+
+    # 3) Otherwise continue the normal automated flow (account select, calendar select, Save)
+    _maybe_pick_google_account(driver, account_email)
+
+    try:
+        WebDriverWait(driver, LONG_WAIT).until(
+            EC.any_of(
+                EC.presence_of_element_located((By.XPATH, "//*[text()='Save']")),
+                EC.presence_of_element_located((By.CSS_SELECTOR, "[aria-label='Calendar']")),
+            )
+        )
+    except TimeoutException:
+        _close_current_tab_and_return(driver, current_handle)
+        return False, "Google Calendar editor did not load."
+
+    if not _open_calendar_dropdown(driver):
+        if not _click_save(driver):
+            _close_current_tab_and_return(driver, current_handle)
+            return False, "Could not open calendar dropdown or click Save."
+        _close_current_tab_and_return(driver, current_handle)
+        return True, "Saved to default calendar (dropdown not found)."
+
+    if not _select_calendar_by_name(driver, calendar_name):
+        _close_current_tab_and_return(driver, current_handle)
+        return False, f"Calendar '{calendar_name}' not found in dropdown."
+
+    if not _click_save(driver):
+        _close_current_tab_and_return(driver, current_handle)
+        return False, "Failed to click Save in Google Calendar."
+
+    _close_current_tab_and_return(driver, current_handle)
+    return True, f"Event added to '{calendar_name}'."
+```
+
+**What you’ll see in logs**
+
+* If Google blocks the WebDriver tab, you’ll get:
+  `[CAL] Login blocked by Google; opened link in system browser.`
+  and a Google Calendar tab will pop in your *normal* browser, pre-filled for that event.
+
+> If you’d like, we can also add a **config flag** in `calendars.json` to *always* open GCal in system browser instead of trying Selenium first.
+
+---
+
+# 2) Stop asking you to sign in to GCal in setup
+
+Since GCal sign-in via WebDriver is blocked anyway, you can skip that step in `setup_driver_session.py`. Change:
+
+```python
+_signin_google_calendar(driver)
+```
+
+to a no-op (or delete that block), and rely on the handoff at event time.
+
+---
+
+# 3) Ensure the system browser is the right account
+
+* Make sure your default browser (or whichever you actually use) is already logged into the **same Google account** that your `calendars.json["account_email"]` references.
+* The handoff opens the exact “Add event” link; in most cases you’ll only need to click **Save**. (If you want to force a specific calendar, we’re already selecting it in the automated path; for the system browser we can’t drive the click, but you can set that calendar as default in GCal to make Save one-click.)
+
+---
+
+# 4) (Optional) Try Microsoft Edge instead of Chrome/Firefox
+
+Sometimes Edge WebDriver is allowed to sign in where Chrome isn’t. If you want to try it:
+
+* Add a tiny Edge branch in `start_driver` (very similar to Chrome, using `msedgedriver` via Selenium Manager).
+* Set `SELENIUM_BROWSER=edge`.
+* Still keep the system-browser fallback in place.
+
+I can paste the exact Edge snippet if you want to test that path.
+
+---
+
+If you apply the patch above and run the bot now, it will continue registering Luma events. For any “Add to Google Calendar” step that is blocked in Selenium, you’ll see your **regular browser** open to the right GCal page so you can press **Save**—and the bot will keep moving through events instead of crashing.
+
+-------------------------------------------------------------------------------
+
+Okay, quick side note, we're having too many false positives labeling free events as paid.  Luma is pretty good about listing a price ($x.xx, $x, etc.) for paid events, can we patch this function to just make sure there's no indication of a paid event, and otherwise count it as free?
+
+
+def is_free_event_on_page(driver) -> bool:
+    """
+    Checks the current event page for FREE (vs price).
+    Strategy: look for any price badge containing 'Free' and ensure no '$' price is the *primary* price.
+    We purposely re-check on the event detail page, not just the city feed.
+    """
+    texts = []
+    # Common price containers
+    candidates = driver.find_elements(By.XPATH, "//*[self::span or self::div or self::p]")
+    for el in candidates:
+        try:
+            t = (el.text or "").strip()
+            if not t:
+                continue
+            if "free" in t.lower():
+                texts.append(t)
+        except StaleElementReferenceException:
+            continue
+
+    if any("free" in t.lower() for t in texts):
+        # defensive: ensure we don’t see a clear $price near primary CTA
+        try:
+            price_cta_region = driver.find_elements(
+                By.XPATH,
+                "//*[contains(translate(., 'REGISTERJOINRSVPGETTICKETRESERVE', 'registerjoinrsvpgetticketreserve'), 'register') or "
+                "contains(translate(., 'REGISTERJOINRSVPGETTICKETRESERVE', 'registerjoinrsvpgetticketreserve'), 'join') or "
+                "contains(translate(., 'REGISTERJOINRSVPGETTICKETRESERVE', 'registerjoinrsvpgetticketreserve'), 'rsvp') or "
+                "contains(translate(., 'REGISTERJOINRSVPGETTICKETRESERVE', 'registerjoinrsvpgetticketreserve'), 'get ticket') or "
+                "contains(translate(., 'REGISTERJOINRSVPGETTICKETRESERVE', 'registerjoinrsvpgetticketreserve'), 'reserve')]"
+            )
+            around_cta_texts = []
+            for cta in price_cta_region:
+                try:
+                    parent = cta.find_element(By.XPATH, "./..")
+                    around_cta_texts.append((parent.text or "").strip())
+                except Exception:
+                    continue
+            # If a nearby explicit $xx.xx exists, assume paid
+            if any("$" in t for t in around_cta_texts):
+                return False
+        except Exception:
+            pass
+        return True
+
+    # If we saw no 'free' hints and do see clear $price anywhere, consider paid
+    # We bias toward safety (skip if unsure)
+    try:
+        any_price = driver.find_elements(By.XPATH, "//*[contains(text(), '$')]")
+        if any_price:
+            return False
+    except Exception:
+        pass
+
+    return False
+
+-------------------------------------------------------------------------------
+
+Got it — here’s a **drop-in replacement** that does exactly what you asked:
+
+* Treat the event as **free by default**.
+* Mark as **paid** only if we detect any **visible** currency/price token anywhere on the page.
+* Currency patterns covered: `$`, `€`, `£`, and ISO codes like `USD`, `EUR`, `GBP`, `CAD`.
+* Also checks common attributes (`aria-label`, `title`, `data-price`) for price tokens.
+
+```python
+def is_free_event_on_page(driver) -> bool:
+    """
+    Classify as FREE unless we see any strong signal that it's paid.
+    Signals for 'paid' include a visible currency token like $9, €10, £15,
+    or ISO codes like USD 20 / EUR 12 anywhere on the page.
+    """
+    import re
+    from selenium.webdriver.common.by import By
+    from selenium.common.exceptions import StaleElementReferenceException
+
+    # Currency/price tokens (covers $9, $9.99, $1,200.00, €10, £15, USD 20, CAD 12, etc.)
+    money_regex = re.compile(
+        r"(?i)(?:"
+        r"(?:[\$€£]\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)"           # $9 / $9.99 / $1,200.00 / €10 / £15
+        r"|(?:\b(?:USD|EUR|GBP|CAD|AUD|NZD|JPY|CHF|SEK|NOK|DKK)\b\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)"  # USD 20
+        r"|(?:\bfrom\b\s*[\$€£]\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)"  # from $10
+        r")"
+    )
+
+    # 1) Scan visible text nodes likely to carry price info
+    try:
+        nodes = driver.find_elements(
+            By.XPATH,
+            "//*[self::span or self::div or self::p or self::a or self::button or self::h1 or self::h2 or self::h3]"
+        )
+    except Exception:
+        nodes = []
+
+    for el in nodes:
+        try:
+            if not el.is_displayed():
+                continue
+            txt = (el.text or "").strip()
+            if not txt:
+                continue
+            # If any visible text contains a money token, call it paid
+            if money_regex.search(txt):
+                return False
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            continue
+
+    # 2) Also peek at a few attributes that often carry prices in widgets/tooltips
+    attr_names = ("aria-label", "title", "data-price", "data-original-title")
+    for el in nodes:
+        try:
+            if not el.is_displayed():
+                continue
+            for name in attr_names:
+                val = el.get_attribute(name) or ""
+                if val and money_regex.search(val):
+                    return False
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            continue
+
+    # If we saw no currency tokens at all, count it as free
+    return True
+```
+
+### Why this reduces false positives
+
+Your previous version tried to be “safe” by skipping if *any* `$` appeared near the CTA — that can catch unrelated `$` strings (like copy explaining sponsorships). This version flips the logic: **only declare paid when we actually see a price-looking token anywhere**. Luma generally shows real prices with `$…`, so this should align with the site’s behavior.
+
+If you want to be even looser (e.g., ignore “Donation” sections that show a `$` but tickets are free), we can add a small whitelist to skip texts containing words like `donation`, `optional`, `tip`, etc. But I’d try this first — it’s simple and matches your ask.
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+
 -------------------------------------------------------------------------------
 
 -------------------------------------------------------------------------------

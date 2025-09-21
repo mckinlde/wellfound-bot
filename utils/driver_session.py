@@ -30,6 +30,9 @@ import time
 import random
 from pathlib import Path
 from contextlib import contextmanager
+from typing import Iterator
+from selenium.webdriver.remote.webdriver import WebDriver
+
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -40,6 +43,10 @@ from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+# add Chrome support (keep Firefox as default)
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.remote.webdriver import WebDriver  # for the return type
 
 # ---------- Configuration ----------
 _DEFAULT_TIMEOUT = 30  # seconds
@@ -55,6 +62,13 @@ _ENV_PERSIST = (os.getenv("FIREFOX_PROFILE_PERSIST") == "1")
 _ENV_PROFILE_DIR = os.getenv("FIREFOX_PROFILE_DIR") or None
 _ENV_PROFILE_NAME = os.getenv("FIREFOX_PROFILE_NAME") or None
 _ENV_PROFILE_BASE = Path(os.getenv("FIREFOX_PROFILE_BASE_DIR") or ".selenium-profiles")
+
+_BROWSER = (os.getenv("SELENIUM_BROWSER") or os.getenv("BROWSER") or "firefox").lower()
+
+# Chrome profile envs (optional)
+_CHROME_PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR") or None
+_CHROME_PROFILE_NAME = os.getenv("CHROME_PROFILE_NAME") or "luma_bot_chrome"
+_CHROME_PROFILE_BASE = Path(os.getenv("CHROME_PROFILE_BASE_DIR") or ".selenium-profiles/chrome")
 
 
 SEED_URLS = [
@@ -146,6 +160,11 @@ def _resolve_profile(
     return chosen_dir, is_persistent, is_temporary
 
 
+# ---------- Browser choice runtime getter ----------
+def _get_browser_choice() -> str:
+    return (os.getenv("SELENIUM_BROWSER") or os.getenv("BROWSER") or "firefox").lower()
+
+
 # ---------- Driver lifecycle ----------
 @contextmanager
 def start_driver(
@@ -155,58 +174,118 @@ def start_driver(
     persist_profile: bool | None = None,
     profile_name: str | None = None,
     profile_dir: str | Path | None = None,
-) -> webdriver.Firefox:
+) -> Iterator[WebDriver]:
     """
-    Start a Firefox WebDriver with either:
+    Start a WebDriver with either:
       - default throwaway temporary profile (deleted on exit), or
       - persistent profile (reused across runs) if requested via args or env.
 
-    Args:
-      headless: override env; if None uses FIREFOX_HEADLESS env.
-      page_load_timeout: int seconds.
-      persist_profile: True to reuse profile across runs; False to always temp.
-      profile_name: logical name under FIREFOX_PROFILE_BASE_DIR (".selenium-profiles/<name>").
-      profile_dir: absolute path to a specific profile directory (overrides profile_name).
+    Browser is selected via env:
+      SELENIUM_BROWSER=firefox (default) or chrome
+      (BROWSER works too if SELENIUM_BROWSER unset)
     """
     _ensure_dirs()
+    logging.info("Browser engine: %s", _get_browser_choice())
 
+    # Resolve a profile directory (works for both Firefox and Chrome)
     profile_path, is_persistent, is_temporary = _resolve_profile(
         persist_profile=persist_profile, profile_name=profile_name, profile_dir=profile_dir
     )
-    logging.info("Firefox profile: %s (%s)", profile_path, "persistent" if is_persistent else "temporary")
 
-    # Options
-    opts = FirefoxOptions()
-    if headless if headless is not None else _HEADLESS:
-        opts.add_argument("-headless")
-
-    # Optional custom Firefox binary
-    if _FIREFOX_BIN:
-        opts.binary_location = _FIREFOX_BIN
-
-    # Use our profile dir explicitly
-    opts.add_argument("-profile")
-    opts.add_argument(str(profile_path))
-
-    # Preferences (downloads, noisiness)
-    downloads_dir = str(Path(profile_path, "downloads"))
-    os.makedirs(downloads_dir, exist_ok=True)
-    opts.set_preference("browser.download.folderList", 2)
-    opts.set_preference("browser.download.dir", downloads_dir)
-    opts.set_preference("browser.download.useDownloadDir", True)
-    opts.set_preference("browser.helperApps.neverAsk.saveToDisk", "text/csv,application/octet-stream,application/pdf,text/plain")
-    opts.set_preference("pdfjs.disabled", True)
-    opts.set_preference("dom.webnotifications.enabled", False)
-    opts.set_preference("general.useragent.updates.enabled", False)
-    opts.set_preference("datareporting.healthreport.uploadEnabled", False)
-
-    # Service: prefer explicit geckodriver path if provided; else Selenium Manager
-    service = FirefoxService(executable_path=_GECKO_PATH) if _GECKO_PATH else FirefoxService()
-
-    driver = None
+    driver: WebDriver | None = None
     try:
-        driver = webdriver.Firefox(options=opts, service=service)
-        # Attach a hint so callers can introspect which profile was used (optional)
+        if _get_browser_choice() == "chrome":
+            # -------- Chrome branch (hardened) --------
+            # Prefer an explicit CHROME_PROFILE_DIR to avoid OneDrive/repo paths
+            chrome_env_dir = os.getenv("CHROME_PROFILE_DIR")
+            if profile_dir:
+                chrome_data_dir = Path(profile_dir)
+            elif chrome_env_dir:
+                chrome_data_dir = Path(chrome_env_dir)
+            else:
+                # Default to LOCALAPPDATA on Windows; else ~/.selenium-profiles/chrome/<name>
+                if os.name == "nt" and os.getenv("LOCALAPPDATA"):
+                    base = Path(os.getenv("LOCALAPPDATA")) / "selenium-profiles" / "chrome"
+                else:
+                    base = Path.home() / ".selenium-profiles" / "chrome"
+                name = profile_name or _ENV_PROFILE_NAME or "luma_bot_chrome"
+                chrome_data_dir = base / name
+
+            chrome_data_dir = chrome_data_dir.expanduser().resolve()
+            chrome_data_dir.mkdir(parents=True, exist_ok=True)
+
+            # Write test: catch OneDrive/permission issues early and fall back to a temp dir
+            try:
+                (chrome_data_dir / ".write_test").write_text("ok", encoding="utf-8")
+                (chrome_data_dir / ".write_test").unlink(missing_ok=True)
+            except Exception as e:
+                logging.warning("Chrome data dir not writable (%s): %s ; falling back to temp", chrome_data_dir, e)
+                import tempfile
+                chrome_data_dir = Path(tempfile.mkdtemp(prefix="chrome-prof-")).resolve()
+
+            logging.info("Chrome user-data-dir: %s", chrome_data_dir)
+
+            copts = ChromeOptions()
+
+            # Headless (use 'new' only when requested)
+            if headless if headless is not None else _HEADLESS:
+                copts.add_argument("--headless=new")
+
+            # Required: unique non-default user-data-dir
+            copts.add_argument(f"--user-data-dir={str(chrome_data_dir)}")
+
+            # Good hygiene flags
+            copts.add_argument("--no-first-run")
+            copts.add_argument("--no-default-browser-check")
+            copts.add_argument("--disable-features=ChromeWhatsNewUI")
+            copts.add_argument("--remote-debugging-port=0")   # avoid fixed-port conflicts
+            copts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            copts.add_experimental_option("useAutomationExtension", False)
+
+            # Downloads inside the profile
+            downloads_dir = str(chrome_data_dir / "downloads")
+            os.makedirs(downloads_dir, exist_ok=True)
+            copts.add_experimental_option("prefs", {
+                "download.default_directory": downloads_dir,
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+                "profile.default_content_setting_values.notifications": 2,
+            })
+
+            cservice = ChromeService()  # Selenium Manager will fetch chromedriver
+            driver = webdriver.Chrome(options=copts, service=cservice)
+
+        else:
+            # -------- Firefox (your existing behavior) --------
+            logging.info("Firefox profile: %s (%s)", profile_path, "persistent" if is_persistent else "temporary")
+
+            fopts = FirefoxOptions()
+            if headless if headless is not None else _HEADLESS:
+                fopts.add_argument("-headless")
+
+            if _FIREFOX_BIN:
+                fopts.binary_location = _FIREFOX_BIN
+
+            # Explicit profile dir
+            fopts.add_argument("-profile")
+            fopts.add_argument(str(profile_path))
+
+            # Preferences (downloads, noisiness)
+            downloads_dir = str(Path(profile_path, "downloads"))
+            os.makedirs(downloads_dir, exist_ok=True)
+            fopts.set_preference("browser.download.folderList", 2)
+            fopts.set_preference("browser.download.dir", downloads_dir)
+            fopts.set_preference("browser.download.useDownloadDir", True)
+            fopts.set_preference("browser.helperApps.neverAsk.saveToDisk", "text/csv,application/octet-stream,application/pdf,text/plain")
+            fopts.set_preference("pdfjs.disabled", True)
+            fopts.set_preference("dom.webnotifications.enabled", False)
+            fopts.set_preference("general.useragent.updates.enabled", False)
+            fopts.set_preference("datareporting.healthreport.uploadEnabled", False)
+
+            fservice = FirefoxService(executable_path=_GECKO_PATH) if _GECKO_PATH else FirefoxService()
+            driver = webdriver.Firefox(options=fopts, service=fservice)
+
+        # Helpful hints
         try:
             setattr(driver, "_profile_dir", str(profile_path))
             setattr(driver, "_profile_persistent", bool(is_persistent))
@@ -214,7 +293,9 @@ def start_driver(
             pass
 
         driver.set_page_load_timeout(page_load_timeout)
+        # IMPORTANT: yield (don’t return another context manager)
         yield driver
+
     finally:
         if driver:
             try:
@@ -222,7 +303,7 @@ def start_driver(
             except Exception as e:
                 logging.warning("Error quitting driver: %s", e)
 
-        # Only remove temp throwaway profiles; never delete persistent ones
+        # Remove only temporary profiles
         if not is_persistent and is_temporary:
             try:
                 shutil.rmtree(profile_path, ignore_errors=True)
@@ -238,7 +319,7 @@ def spinup_driver(
     persist_profile: bool | None = None,
     profile_name: str | None = None,
     profile_dir: str | Path | None = None,
-):
+) -> Iterator[WebDriver]:
     cm = start_driver(
         headless=headless,
         page_load_timeout=page_load_timeout,

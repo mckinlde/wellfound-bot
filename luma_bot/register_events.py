@@ -150,58 +150,64 @@ def collect_city_event_links(driver) -> List[str]:
 
 def is_free_event_on_page(driver) -> bool:
     """
-    Checks the current event page for FREE (vs price).
-    Strategy: look for any price badge containing 'Free' and ensure no '$' price is the *primary* price.
-    We purposely re-check on the event detail page, not just the city feed.
+    Classify as FREE unless we see any strong signal that it's paid.
+    Signals for 'paid' include a visible currency token like $9, €10, £15,
+    or ISO codes like USD 20 / EUR 12 anywhere on the page.
     """
-    texts = []
-    # Common price containers
-    candidates = driver.find_elements(By.XPATH, "//*[self::span or self::div or self::p]")
-    for el in candidates:
+    import re
+    from selenium.webdriver.common.by import By
+    from selenium.common.exceptions import StaleElementReferenceException
+
+    # Currency/price tokens (covers $9, $9.99, $1,200.00, €10, £15, USD 20, CAD 12, etc.)
+    money_regex = re.compile(
+        r"(?i)(?:"
+        r"(?:[\$€£]\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)"           # $9 / $9.99 / $1,200.00 / €10 / £15
+        r"|(?:\b(?:USD|EUR|GBP|CAD|AUD|NZD|JPY|CHF|SEK|NOK|DKK)\b\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)"  # USD 20
+        r"|(?:\bfrom\b\s*[\$€£]\s?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)"  # from $10
+        r")"
+    )
+
+    # 1) Scan visible text nodes likely to carry price info
+    try:
+        nodes = driver.find_elements(
+            By.XPATH,
+            "//*[self::span or self::div or self::p or self::a or self::button or self::h1 or self::h2 or self::h3]"
+        )
+    except Exception:
+        nodes = []
+
+    for el in nodes:
         try:
-            t = (el.text or "").strip()
-            if not t:
+            if not el.is_displayed():
                 continue
-            if "free" in t.lower():
-                texts.append(t)
+            txt = (el.text or "").strip()
+            if not txt:
+                continue
+            # If any visible text contains a money token, call it paid
+            if money_regex.search(txt):
+                return False
         except StaleElementReferenceException:
             continue
-
-    if any("free" in t.lower() for t in texts):
-        # defensive: ensure we don’t see a clear $price near primary CTA
-        try:
-            price_cta_region = driver.find_elements(
-                By.XPATH,
-                "//*[contains(translate(., 'REGISTERJOINRSVPGETTICKETRESERVE', 'registerjoinrsvpgetticketreserve'), 'register') or "
-                "contains(translate(., 'REGISTERJOINRSVPGETTICKETRESERVE', 'registerjoinrsvpgetticketreserve'), 'join') or "
-                "contains(translate(., 'REGISTERJOINRSVPGETTICKETRESERVE', 'registerjoinrsvpgetticketreserve'), 'rsvp') or "
-                "contains(translate(., 'REGISTERJOINRSVPGETTICKETRESERVE', 'registerjoinrsvpgetticketreserve'), 'get ticket') or "
-                "contains(translate(., 'REGISTERJOINRSVPGETTICKETRESERVE', 'registerjoinrsvpgetticketreserve'), 'reserve')]"
-            )
-            around_cta_texts = []
-            for cta in price_cta_region:
-                try:
-                    parent = cta.find_element(By.XPATH, "./..")
-                    around_cta_texts.append((parent.text or "").strip())
-                except Exception:
-                    continue
-            # If a nearby explicit $xx.xx exists, assume paid
-            if any("$" in t for t in around_cta_texts):
-                return False
         except Exception:
-            pass
-        return True
+            continue
 
-    # If we saw no 'free' hints and do see clear $price anywhere, consider paid
-    # We bias toward safety (skip if unsure)
-    try:
-        any_price = driver.find_elements(By.XPATH, "//*[contains(text(), '$')]")
-        if any_price:
-            return False
-    except Exception:
-        pass
+    # 2) Also peek at a few attributes that often carry prices in widgets/tooltips
+    attr_names = ("aria-label", "title", "data-price", "data-original-title")
+    for el in nodes:
+        try:
+            if not el.is_displayed():
+                continue
+            for name in attr_names:
+                val = el.get_attribute(name) or ""
+                if val and money_regex.search(val):
+                    return False
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            continue
 
-    return False
+    # If we saw no currency tokens at all, count it as free
+    return True
 
 
 def open_register_cta(driver) -> bool:
