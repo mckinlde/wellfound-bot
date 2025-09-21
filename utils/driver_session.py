@@ -3,13 +3,20 @@
 driver_session abstracts Selenium WebDriver state from the rest of the app.
 - Provides a context-managed Firefox driver with sane defaults.
 - Works whether or not FIREFOX_BIN / GECKODRIVER_PATH are set (falls back to Selenium Manager).
-- Creates a throwaway Firefox profile per run and cleans it up deterministically.
-- Includes small utilities to fetch BeautifulSoup from a URL and persist HTML safely.
+- DEFAULT: Creates a throwaway Firefox profile per run and cleans it up deterministically.
+- OPTIONAL: Can reuse a persistent Firefox profile across runs (for saved logins).
 
 Env (optional):
-  FIREFOX_BIN          -> path to firefox.exe (overrides system default)
-  GECKODRIVER_PATH     -> path to geckodriver.exe (overrides Selenium Manager)
-  FIREFOX_HEADLESS     -> "1" to run headless (default: windowed)
+  FIREFOX_BIN              -> path to firefox.exe (overrides system default)
+  GECKODRIVER_PATH         -> path to geckodriver.exe (overrides Selenium Manager)
+  FIREFOX_HEADLESS         -> "1" to run headless (default: windowed)
+
+  # Persistent profile controls (optional; all backwards-compatible):
+  FIREFOX_PROFILE_PERSIST  -> "1" to reuse a persistent profile (default: temp throwaway)
+  FIREFOX_PROFILE_NAME     -> logical name under FIREFOX_PROFILE_BASE_DIR (e.g., "luma_bot")
+  FIREFOX_PROFILE_BASE_DIR -> base dir for named profiles (default: ".selenium-profiles")
+  FIREFOX_PROFILE_DIR      -> absolute path to a specific profile dir (overrides NAME+BASE)
+
 """
 
 from __future__ import annotations
@@ -42,6 +49,12 @@ _LOG_DEBUG_DIR = Path("logs/debug")
 _FIREFOX_BIN = os.getenv("FIREFOX_BIN") or None
 _GECKO_PATH = os.getenv("GECKODRIVER_PATH") or None
 _HEADLESS = (os.getenv("FIREFOX_HEADLESS") == "1")
+
+# Persistent profile envs
+_ENV_PERSIST = (os.getenv("FIREFOX_PROFILE_PERSIST") == "1")
+_ENV_PROFILE_DIR = os.getenv("FIREFOX_PROFILE_DIR") or None
+_ENV_PROFILE_NAME = os.getenv("FIREFOX_PROFILE_NAME") or None
+_ENV_PROFILE_BASE = Path(os.getenv("FIREFOX_PROFILE_BASE_DIR") or ".selenium-profiles")
 
 
 SEED_URLS = [
@@ -79,21 +92,88 @@ def write_soup_to_file(soup: BeautifulSoup, file_name: str) -> Path:
     return write_html_to_file(soup.prettify(), file_name)
 
 
+# ---------- Internal profile resolver ----------
+def _resolve_profile(
+    persist_profile: bool | None,
+    profile_name: str | None,
+    profile_dir: str | Path | None,
+) -> tuple[Path, bool, bool]:
+    """
+    Decide which profile directory to use.
+
+    Returns:
+      (profile_path, is_persistent, is_temporary)
+    """
+    # Explicit args take precedence; otherwise env; otherwise temp.
+    arg_persist = bool(persist_profile) if persist_profile is not None else None
+
+    # 1) If a specific directory is given/ENVed, use it and mark persistent
+    chosen_dir: Path | None = None
+    if profile_dir:
+        chosen_dir = Path(profile_dir)
+        is_persistent = True
+    elif _ENV_PROFILE_DIR:
+        chosen_dir = Path(_ENV_PROFILE_DIR)
+        is_persistent = True
+    else:
+        # 2) If a name is given/ENVed, build under base and mark persistent
+        name = profile_name or _ENV_PROFILE_NAME
+        if name:
+            chosen_dir = _ENV_PROFILE_BASE / name
+            is_persistent = True
+        else:
+            # 3) Otherwise, temp throwaway
+            tmp = tempfile.mkdtemp(prefix="ff-profile-")
+            chosen_dir = Path(tmp)
+            is_persistent = False
+
+    # arg_persist can force persistent behavior (but never force-delete a named/explicit dir)
+    if arg_persist is not None:
+        if arg_persist:
+            is_persistent = True
+        else:
+            # Only allow forcing non-persistent if we were going to temp anyway
+            if is_persistent and (profile_dir or profile_name or _ENV_PROFILE_DIR or _ENV_PROFILE_NAME or _ENV_PERSIST):
+                # Ignore the force-off in this scenario to avoid deleting user dirs.
+                pass
+
+    # ENV_PERSIST can flip a temp into persistent (by simply not deleting later)
+    if _ENV_PERSIST:
+        is_persistent = True
+
+    chosen_dir.mkdir(parents=True, exist_ok=True)
+    is_temporary = not is_persistent and chosen_dir.name.startswith("ff-profile-")
+    return chosen_dir, is_persistent, is_temporary
+
+
 # ---------- Driver lifecycle ----------
 @contextmanager
 def start_driver(
     *,
     headless: bool | None = None,
     page_load_timeout: int = _DEFAULT_TIMEOUT,
+    persist_profile: bool | None = None,
+    profile_name: str | None = None,
+    profile_dir: str | Path | None = None,
 ) -> webdriver.Firefox:
     """
-    Start a Firefox WebDriver with a temporary profile. Cleans up on exit.
+    Start a Firefox WebDriver with either:
+      - default throwaway temporary profile (deleted on exit), or
+      - persistent profile (reused across runs) if requested via args or env.
 
-    headless: override env; if None uses FIREFOX_HEADLESS env.
+    Args:
+      headless: override env; if None uses FIREFOX_HEADLESS env.
+      page_load_timeout: int seconds.
+      persist_profile: True to reuse profile across runs; False to always temp.
+      profile_name: logical name under FIREFOX_PROFILE_BASE_DIR (".selenium-profiles/<name>").
+      profile_dir: absolute path to a specific profile directory (overrides profile_name).
     """
     _ensure_dirs()
-    profile_dir = tempfile.mkdtemp(prefix="ff-profile-")
-    logging.info("Using temp Firefox profile: %s", profile_dir)
+
+    profile_path, is_persistent, is_temporary = _resolve_profile(
+        persist_profile=persist_profile, profile_name=profile_name, profile_dir=profile_dir
+    )
+    logging.info("Firefox profile: %s (%s)", profile_path, "persistent" if is_persistent else "temporary")
 
     # Options
     opts = FirefoxOptions()
@@ -104,13 +184,12 @@ def start_driver(
     if _FIREFOX_BIN:
         opts.binary_location = _FIREFOX_BIN
 
-    # Use our temp profile dir explicitly
+    # Use our profile dir explicitly
     opts.add_argument("-profile")
-    opts.add_argument(profile_dir)
+    opts.add_argument(str(profile_path))
 
     # Preferences (downloads, noisiness)
-    # Note: 'download.dir' must be an absolute path
-    downloads_dir = str(Path(profile_dir, "downloads"))
+    downloads_dir = str(Path(profile_path, "downloads"))
     os.makedirs(downloads_dir, exist_ok=True)
     opts.set_preference("browser.download.folderList", 2)
     opts.set_preference("browser.download.dir", downloads_dir)
@@ -127,6 +206,13 @@ def start_driver(
     driver = None
     try:
         driver = webdriver.Firefox(options=opts, service=service)
+        # Attach a hint so callers can introspect which profile was used (optional)
+        try:
+            setattr(driver, "_profile_dir", str(profile_path))
+            setattr(driver, "_profile_persistent", bool(is_persistent))
+        except Exception:
+            pass
+
         driver.set_page_load_timeout(page_load_timeout)
         yield driver
     finally:
@@ -135,16 +221,31 @@ def start_driver(
                 driver.quit()
             except Exception as e:
                 logging.warning("Error quitting driver: %s", e)
-        try:
-            shutil.rmtree(profile_dir, ignore_errors=True)
-        except Exception as e:
-            logging.warning("Error removing temp profile dir: %s", e)
+
+        # Only remove temp throwaway profiles; never delete persistent ones
+        if not is_persistent and is_temporary:
+            try:
+                shutil.rmtree(profile_path, ignore_errors=True)
+            except Exception as e:
+                logging.warning("Error removing temp profile dir: %s", e)
 
 
 # ---------- Driver warmup + context manager ----------
 @contextmanager
-def spinup_driver(headless=False, page_load_timeout=30):
-    cm = start_driver(headless=headless, page_load_timeout=page_load_timeout)
+def spinup_driver(
+    headless: bool = False,
+    page_load_timeout: int = 30,
+    persist_profile: bool | None = None,
+    profile_name: str | None = None,
+    profile_dir: str | Path | None = None,
+):
+    cm = start_driver(
+        headless=headless,
+        page_load_timeout=page_load_timeout,
+        persist_profile=persist_profile,
+        profile_name=profile_name,
+        profile_dir=profile_dir,
+    )
     driver = cm.__enter__()
     try:
         # warmup visits

@@ -5,7 +5,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select
 
 # Load profile.json once
-PROFILE = json.loads(Path("luma-bot/profile.json").read_text())
+PROFILE = json.loads(Path("luma_bot/profile.json").read_text())
 
 FIELD_MAP = {
     "full_name": ["name", "full name", "your name"],

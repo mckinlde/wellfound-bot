@@ -1320,27 +1320,1184 @@ feat(luma-bot): add end-to-end Luma auto-register pipeline with free-event filte
 
 -------------------------------------------------------------------------------
 
--------------------------------------------------------------------------------
+How do I run it?
 
 -------------------------------------------------------------------------------
 
--------------------------------------------------------------------------------
+Here’s the fastest path to a first run on Windows (PowerShell), plus a “schedule-ready” way to run it.
+
+# One-time setup
+
+1. **Folder names (important):** make sure the Python package folder is `luma_bot` (underscore), not `luma-bot`. Put all these files inside it:
+
+* `luma_bot/register_events.py`
+* `luma_bot/form_filler.py`
+* `luma_bot/calendar_clicker.py`
+* `luma_bot/logger.py`
+* `luma_bot/profile.json`
+* `luma_bot/calendars.json`
+
+2. **Create venv & install deps**
+
+```powershell
+cd C:\path\to\your\repo
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install selenium
+```
+
+(Your `utils/driver_session.py` should handle the browser driver; if not, also `pip install webdriver-manager` and use it there.)
+
+3. **Fill configs**
+
+* Edit `luma_bot\profile.json` with your real name/email/phone, etc.
+* Edit `luma_bot\calendars.json` with your Google account email and the city→calendar name map.
+* First run should be **non-headless** so you can sign into Google once in that Selenium profile.
+
+# Quick test run (non-headless)
+
+From repo root:
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle" --max-per-city 3
+```
+
+Tips:
+
+* Use a small `--max-per-city` first.
+* Watch it scroll, open events, fill forms, then hit “Add to Google Calendar” and select your mapped calendar.
+* Logs: `.\logs\successful_events.log` and `.\logs\failed_events.log`
+* De-dupe: `.\luma_bot\data\registered_events.json`
+
+# Multi-city run
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland,san-francisco"
+```
+
+# Headless (after you’ve signed into Google once)
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland" --headless
+```
+
+# Schedule-ready PowerShell wrapper (optional)
+
+If you want a wrapper script, create `scripts\run-luma-bot.ps1` like this:
+
+```powershell
+param(
+  [Parameter(Mandatory = $true)] [string]$Cities,
+  [string]$RepoRoot = ".",
+  [string]$VenvPath = ".\.venv\Scripts\python.exe",
+  [string]$ProfileJson = "luma_bot\profile.json",
+  [int]$MaxPerCity = 0,
+  [switch]$Headless
+)
+Set-Location -Path $RepoRoot
+$py = $VenvPath
+$script = "luma_bot\register_events.py"
+$argList = @("--cities", $Cities, "--profile-json", $ProfileJson)
+if ($MaxPerCity -gt 0) { $argList += @("--max-per-city", "$MaxPerCity") }
+if ($Headless) { $argList += "--headless" }
+& $py $script @argList
+exit $LASTEXITCODE
+```
+
+Run it like:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run-luma-bot.ps1 -Cities "seattle,portland" -RepoRoot "$PWD" -MaxPerCity 5
+```
+
+## Common gotchas
+
+* **Google sign-in:** do the first run non-headless and complete sign-in. Keep using the same driver profile your `driver_session.py` sets up.
+* **Paid events:** the bot will skip anything not clearly marked **Free**.
+* **Unmapped required fields:** these will be logged in `failed_events.log` with the event URL. Add missing keys to `profile.json` and re-run.
+* **Hyphen vs underscore:** Python imports require `luma_bot` (underscore). If you had any paths using `luma-bot`, switch them to `luma_bot`.
+
+If you hit an error, paste the exact console output and I’ll pinpoint the fix.
 
 -------------------------------------------------------------------------------
 
--------------------------------------------------------------------------------
+Looks like it failed to find the events:
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> .\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle" --max-per-city 3
+>> 
+Could not find platform independent libraries <prefix>
+2025-09-20 18:16:14 [INFO] [CITY] Visiting https://luma.com/seattle
+2025-09-20 18:16:20 [INFO] [CITY] Found 0 candidate event links.
+2025-09-20 18:16:20 [INFO] [CITY] Done. Processed 0 events for 'seattle'.
 
 -------------------------------------------------------------------------------
 
--------------------------------------------------------------------------------
+Nice catch — the city page is fine, but my link filter was too strict.
+On Luma, **event links are usually short slugs** like `https://luma.com/yu2ccnvr` or `https://lu.ma/tnogkouo` (no `/event` or `/events` in the path), so our collector ignored them and returned 0. You can see this on the Seattle page and a sample event: ([Luma][1])
+
+Here’s a drop-in patch to make `collect_city_event_links()` recognize those short slugs and (if needed) fall back to card links:
+
+---
+
+### Patch `luma_bot/register_events.py`
+
+Add imports near the top:
+
+```python
+import re
+from urllib.parse import urlparse
+```
+
+Replace your current `collect_city_event_links` with this version (it’s tolerant of both luma.com and lu.ma, skips the CDN, and accepts single-segment slugs):
+
+```python
+def collect_city_event_links(driver) -> List[str]:
+    """
+    Collect candidate event links from a city listing page.
+
+    Luma event URLs are usually short slugs like:
+      https://luma.com/yu2ccnvr  or  https://lu.ma/tnogkouo
+    (no '/event' or '/events' segment). This collector accepts:
+      • absolute luma.com / lu.ma single-segment paths
+      • '/event/...', '/e/...' (older patterns)
+      • relative versions of the above
+    """
+
+    def looks_like_event_url(href: str) -> bool:
+        if not href or href.startswith(("mailto:", "tel:")):
+            return False
+
+        # Absolute short slug or /event|/e/ style
+        if re.match(r"^https?://(luma\.com|lu\.ma)/[A-Za-z0-9_-]{4,}$", href):
+            return True
+        if re.match(r"^https?://(luma\.com|lu\.ma)/(event|e)/.+", href):
+            return True
+
+        # Relative versions
+        if href.startswith("/"):
+            path = href.split("?")[0].strip("/")
+            parts = path.split("/")
+            blocked = {"discover", "help", "pricing", "host", "login", "signup", "map"}
+            if len(parts) == 1 and parts[0] and parts[0] not in blocked and len(parts[0]) >= 4:
+                return True
+            if parts and parts[0] in {"event", "e"} and len(parts) > 1:
+                return True
+
+        return False
+
+    anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
+    matched: List[str] = []
+
+    for a in anchors:
+        try:
+            href = a.get_attribute("href") or ""
+            if looks_like_event_url(href):
+                netloc = urlparse(href).netloc
+                if "lumacdn.com" in netloc:
+                    continue  # skip CDN images
+                matched.append(href)
+                continue
+
+            # Try relative hrefs
+            if href.startswith("/") and looks_like_event_url(BASE.rstrip("/") + href):
+                matched.append(BASE.rstrip("/") + href)
+        except StaleElementReferenceException:
+            continue
+
+    # Fallback: some cards are clickable containers; grab the nearest ancestor with href/data-href
+    if not matched:
+        cards = driver.find_elements(
+            By.XPATH, "//h3/ancestor::*[self::a or @role='link' or @data-href][1]"
+        )
+        for el in cards:
+            try:
+                href = el.get_attribute("href") or el.get_attribute("data-href") or ""
+                if href and looks_like_event_url(href):
+                    if href.startswith("/"):
+                        href = BASE.rstrip("/") + href
+                    matched.append(href)
+            except StaleElementReferenceException:
+                continue
+
+    matched = sorted(set(matched))
+    print(f"[DEBUG] Anchors: {len(anchors)}, event-like: {len(matched)}")
+    return matched
+```
+
+Optionally, make the scrolling a bit “stickier” to ensure all cards load:
+
+```python
+def robust_scroll_to_bottom(driver, quiet_secs: float = 1.0, max_rounds: int = 60):
+    last_height = 0
+    rounds_same = 0
+    for _ in range(max_rounds):
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(quiet_secs)
+        height = driver.execute_script("return document.body.scrollHeight")
+        if height == last_height:
+            rounds_same += 1
+            if rounds_same >= 2:
+                break
+        else:
+            rounds_same = 0
+        last_height = height
+
+    # Try a 'Load more' if present
+    try:
+        btns = driver.find_elements(By.XPATH, "//button[contains(., 'Load more') or contains(., 'Show more')]")
+        if btns:
+            btns[0].click()
+            time.sleep(1.5)
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(quiet_secs)
+    except Exception:
+        pass
+```
+
+---
+
+### Re-run (small batch first)
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle" --max-per-city 3
+```
+
+You should now see something like:
+
+```
+[DEBUG] Anchors: 120, event-like: 24
+[CITY] Found 24 candidate event links.
+```
+
+If it still returns 0, ping me with the console output and I’ll add a second fallback that literally clicks each visible card (by `<h3>` title) to harvest the canonical event URL before proceeding.
+
+(For reference: Seattle city page exists and lists events; individual event pages use short slugs. That’s why we adjusted the matcher.) ([Luma][1])
+
+[1]: https://luma.com/seattle "Popular events in Seattle · Events Calendar"
 
 -------------------------------------------------------------------------------
 
--------------------------------------------------------------------------------
+It had some false positives on paid events, but the main issue is that I wasn't signed in to Luma in the new session.  Can we implement a quick setup_driver_session.py that will trigger human-guided signins for both Luma and Google before handing off to register_events?
+
+
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> .\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle" --max-per-city 3
+Could not find platform independent libraries <prefix>
+2025-09-20 18:20:02 [INFO] [CITY] Visiting https://luma.com/seattle
+[DEBUG] Anchors: 39, event-like: 18
+2025-09-20 18:20:08 [INFO] [CITY] Found 18 candidate event links.
+2025-09-20 18:20:13 [FAIL] [PAID] Skipping non-free event :: https://luma.com/46lyzgf8
+2025-09-20 18:20:13 [FAIL] [FAIL] Non-free event :: https://luma.com/46lyzgf8
+2025-09-20 18:20:18 [FAIL] [PAID] Skipping non-free event :: https://luma.com/4v0m67y2
+2025-09-20 18:20:18 [FAIL] [FAIL] Non-free event :: https://luma.com/4v0m67y2
+[FAIL] Message: Element <textarea class="lux-naked-input mounted"> is not reachable by keyboard; For documentation on this error, please visit: https://www.selenium.dev/documentation/webdriver/troubleshooting/errors#elementnotinteractableexception
+Stacktrace:
+RemoteError@chrome://remote/content/shared/RemoteError.sys.mjs:8:8
+WebDriverError@chrome://remote/content/shared/webdriver/Errors.sys.mjs:199:5
+ElementNotInteractableError@chrome://remote/content/shared/webdriver/Errors.sys.mjs:368:5
+webdriverSendKeysToElement@chrome://remote/content/marionette/interaction.sys.mjs:667:13
+interaction.sendKeysToElement@chrome://remote/content/marionette/interaction.sys.mjs:639:11
+sendKeysToElement@chrome://remote/content/marionette/actors/MarionetteCommandsChild.sys.mjs:609:29
+receiveMessage@chrome://remote/content/marionette/actors/MarionetteCommandsChild.sys.mjs:269:31
+
+2025-09-20 18:20:25 [FAIL] [FAIL] Form fill failed (likely unmapped required field) :: https://luma.com/create
+2025-09-20 18:20:25 [INFO] [CITY] Done. Processed 3 events for 'seattle'.
 
 -------------------------------------------------------------------------------
 
+Got it. Here’s a **drop-in, human-guided sign-in launcher** that:
+
+* opens Luma login and waits for you to finish signing in,
+* opens Google Calendar and waits for you to finish,
+* closes that browser,
+* then **hands off to your existing** `register_events.py` with the same args.
+
+It assumes your `utils/driver_session.start_driver()` uses a **persistent browser profile** (e.g., Chrome user-data-dir) so the sign-ins stick for subsequent runs.
+
+---
+
+# `luma_bot/setup_driver_session.py`
+
+```python
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from typing import Iterable
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+
+# Your driver context manager
+from utils.driver_session import start_driver
+
+# Reuse your runner after sign-in
+from luma_bot import register_events
+
+
+def _prompt(msg: str):
+    print(msg)
+    input("Press Enter when you're done… ")
+
+
+def _wait_any(driver, xpaths: list[str], timeout: int = 10) -> bool:
+    """Return True if any of the xpaths appears within timeout."""
+    end = time.time() + timeout
+    while time.time() < end:
+        for xp in xpaths:
+            try:
+                WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, xp)))
+                return True
+            except TimeoutException:
+                continue
+    return False
+
+
+def _signin_luma(driver) -> bool:
+    """
+    Open Luma login and wait for user to complete sign-in.
+    Works for luma.com or lu.ma (they redirect freely).
+    """
+    driver.get("https://luma.com/login")
+    time.sleep(1.0)
+    _prompt(
+        "\n[Action] Sign in to Luma in the opened browser.\n"
+        " - If redirected to lu.ma, complete the login there.\n"
+        " - Make sure you end up logged in (avatar/menu visible).\n"
+        "When finished,"
+    )
+    # Best-effort verification (works for common nav variants)
+    ok = _wait_any(
+        driver,
+        xpaths=[
+            "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'log out')]",
+            "//*[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'sign out')]",
+            "//*[@aria-label='Account' or @aria-label='Profile']",
+            "//a[contains(@href, '/logout') or contains(@href, '/signout')]",
+        ],
+        timeout=8,
+    )
+    print(f"[LUMA] Login check: {'OK' if ok else 'Not verified (continuing anyway)'}")
+    return ok
+
+
+def _signin_google_calendar(driver) -> bool:
+    """
+    Open Google Calendar and wait for user sign-in;
+    we check for Create button or left sidebar as a success signal.
+    """
+    driver.get("https://calendar.google.com/calendar/u/0/r")
+    time.sleep(1.0)
+    _prompt(
+        "\n[Action] Sign in to your Google account (the one in calendars.json),\n"
+        "then ensure Google Calendar loads fully.\n"
+        "When the calendar UI is visible,"
+    )
+    ok = _wait_any(
+        driver,
+        xpaths=[
+            "//*[@aria-label='Create']",
+            "//div[@role='button' and .//span[text()='Create']]",
+            "//*[@aria-label='Main menu']",
+        ],
+        timeout=12,
+    )
+    print(f"[GCAL] Calendar UI check: {'OK' if ok else 'Not verified (continuing anyway)'}")
+    return ok
+
+
+def parse_args(argv: Iterable[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="One-time interactive sign-in for Luma & Google Calendar, then run register_events."
+    )
+    p.add_argument("--cities", required=True, help="Comma-separated city slugs, e.g. 'seattle,portland'")
+    p.add_argument("--max-per-city", type=int, default=None, help="Optional cap per city")
+    p.add_argument("--headless", action="store_true", help="Run register_events headless AFTER sign-in")
+    p.add_argument("--profile-json", default="luma_bot/profile.json", help="Path to profile.json (sanity check)")
+    return p.parse_args(list(argv))
+
+
+def main(argv: Iterable[str] = None):
+    args = parse_args(argv or sys.argv[1:])
+
+    # 1) Open a NON-headless browser so you can sign in
+    with start_driver() as driver:
+        print("[SETUP] Starting interactive sign-in…")
+        _signin_luma(driver)
+        _signin_google_calendar(driver)
+        print("[SETUP] Sign-in steps done. Closing this browser…")
+
+    # 2) Hand off to your normal runner (with whatever mode you want)
+    print("[HANDOFF] Launching register_events with your args…\n")
+    handoff_args = []
+    handoff_args += ["--cities", args.cities]
+    if args.max_per_city is not None:
+        handoff_args += ["--max-per-city", str(args.max_per_city)]
+    handoff_args += ["--profile-json", args.profile_json]
+    if args.headless:
+        handoff_args += ["--headless"]
+
+    # Call register_events.main() directly to keep it simple
+    register_events.main(handoff_args)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## How to use it
+
+1. Make sure `start_driver()` uses a **persistent profile** (e.g., Chrome `--user-data-dir` pointing to a fixed folder). If it’s ephemeral, sign-ins won’t be remembered.
+
+2. First run (interactive sign-ins, then handoff):
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 3
+```
+
+* Sign into **Luma** when prompted.
+* Sign into **Google Calendar** when prompted.
+* The script closes that window and immediately calls your **normal** runner using the saved session.
+
+3. Subsequent runs (no setup needed):
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland" --headless
+```
+
+---
+
+## Optional quick patches (based on your logs)
+
+### 1) Reduce paid false-positives
+
+Replace `is_free_event_on_page()` with this stricter version in `register_events.py`:
+
+```python
+def is_free_event_on_page(driver) -> bool:
+    """
+    Declare FREE only if:
+      - A visible element says 'Free' (badge/price),
+      - AND no visible '$' price is in the primary price/CTA region.
+    Otherwise return False (skip).
+    """
+    # Look for explicit 'Free'
+    try:
+        free_badges = driver.find_elements(By.XPATH, "//*[self::span or self::div or self::p][contains(translate(.,'FREE','free'),'free')]")
+        has_free = any((el.is_displayed() and 'free' in (el.text or '').lower()) for el in free_badges)
+    except Exception:
+        has_free = False
+
+    # Look near CTAs for $price
+    try:
+        price_near_cta = driver.find_elements(
+            By.XPATH,
+            "//*[self::button or self::a][contains(translate(.,'REGISTERJOINRSVPGETTICKETRESERVE','registerjoinrsvpgetticketreserve'),'register') "
+            "or contains(translate(.,'REGISTERJOINRSVPGETTICKETRESERVE','registerjoinrsvpgetticketreserve'),'rsvp') "
+            "or contains(translate(.,'REGISTERJOINRSVPGETTICKETRESERVE','registerjoinrsvpgetticketreserve'),'join') "
+            "or contains(translate(.,'REGISTERJOINRSVPGETTICKETRESERVE','registerjoinrsvpgetticketreserve'),'get ticket') "
+            "or contains(translate(.,'REGISTERJOINRSVPGETTICKETRESERVE','registerjoinrsvpgetticketreserve'),'reserve')]"
+        )
+        any_dollar = False
+        for cta in price_near_cta:
+            try:
+                region = cta.find_element(By.XPATH, "./ancestor::*[self::section or self::div][1]")
+                if "$" in (region.text or ""):
+                    any_dollar = True
+                    break
+            except Exception:
+                continue
+    except Exception:
+        any_dollar = False
+
+    return bool(has_free and not any_dollar)
+```
+
+### 2) Fix “not reachable by keyboard” on `<textarea>`
+
+In `form_filler.py`, before sending keys, ensure visibility and fall back to JS:
+
+```python
+from selenium.webdriver.support import expected_conditions as EC
+
+def _send_keys_safe(driver, el, value: str):
+    try:
+        WebDriverWait(driver, 5).until(EC.element_to_be_clickable(el))
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        el.clear()
+        el.send_keys(value)
+        return
+    except Exception:
+        # Fallback: set value via JS + dispatch events (helps with masked/overlayed inputs)
+        driver.execute_script("""
+            const el = arguments[0], val = arguments[1];
+            const setVal = (e,v) => { e.value = v; e.dispatchEvent(new Event('input', {bubbles:true})); e.dispatchEvent(new Event('change', {bubbles:true})); };
+            if (el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && el.type !== 'checkbox' && el.type !== 'radio')) {
+                setVal(el, val);
+            } else if (el.hasAttribute('contenteditable')) {
+                el.innerText = val;
+                el.dispatchEvent(new Event('input', {bubbles:true}));
+            }
+        """, el, value)
+```
+
+…and use `_send_keys_safe(driver, field, value)` wherever you previously called `send_keys`.
+
+---
+
+If your `start_driver()` doesn’t currently persist a profile, I can give you a crisp snippet to add to it for Chrome/Edge that writes to, e.g., `.selenium-profile/luma_bot`, so these sign-ins stick between runs.
+
 -------------------------------------------------------------------------------
+
+Here's utils/driver_session.py, make whatever changes you need, but keep interoperability in mind--this file is used across many scrapers.
+
+<driver_session.py>
+
+-------------------------------------------------------------------------------
+
+Awesome—let’s make sign-ins stick.
+
+Below is a **drop-in replacement** for `utils/driver_session.py` that adds **optional persistent Firefox profiles** while keeping the old, throwaway-per-run default. Then I show tiny patches so your `setup_driver_session.py` signs in once using a persistent profile and your `register_events.py` reuses it (or you can just set two env vars and avoid touching other code).
+
+---
+
+# ✅ What changes you get
+
+* **New optional args/env vars** for persistent sessions:
+
+  * `persist_profile: bool = None`
+  * `profile_name: str | None = None` (stored under `.selenium-profiles/<name>`)
+  * `profile_dir: str | Path | None = None` (absolute path you choose)
+* **Backwards-compatible default**: still creates a temporary throwaway profile and deletes it on exit.
+* **Env overrides** (so you don’t have to change other scrapers):
+
+  * `FIREFOX_PROFILE_PERSIST=1`
+  * `FIREFOX_PROFILE_NAME=luma_bot`
+  * `FIREFOX_PROFILE_BASE_DIR=.selenium-profiles` (default)
+  * `FIREFOX_PROFILE_DIR=<absolute path>` (beats the above two)
+* Download prefs still set; only the temp profile folder cleanup changes (persistent profiles are **not** deleted).
+
+---
+
+# 🔧 Updated `utils/driver_session.py` (copy–paste)
+
+```python
+# driver_session.py
+"""
+driver_session abstracts Selenium WebDriver state from the rest of the app.
+- Provides a context-managed Firefox driver with sane defaults.
+- Works whether or not FIREFOX_BIN / GECKODRIVER_PATH are set (falls back to Selenium Manager).
+- DEFAULT: Creates a throwaway Firefox profile per run and cleans it up deterministically.
+- OPTIONAL: Can reuse a persistent Firefox profile across runs (for saved logins).
+
+Env (optional):
+  FIREFOX_BIN              -> path to firefox.exe (overrides system default)
+  GECKODRIVER_PATH         -> path to geckodriver.exe (overrides Selenium Manager)
+  FIREFOX_HEADLESS         -> "1" to run headless (default: windowed)
+
+  # Persistent profile controls (optional; all backwards-compatible):
+  FIREFOX_PROFILE_PERSIST  -> "1" to reuse a persistent profile (default: temp throwaway)
+  FIREFOX_PROFILE_NAME     -> logical name under FIREFOX_PROFILE_BASE_DIR (e.g., "luma_bot")
+  FIREFOX_PROFILE_BASE_DIR -> base dir for named profiles (default: ".selenium-profiles")
+  FIREFOX_PROFILE_DIR      -> absolute path to a specific profile dir (overrides NAME+BASE)
+
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import tempfile
+import logging
+import time
+import random
+from pathlib import Path
+from contextlib import contextmanager
+
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.common.exceptions import WebDriverException, NoSuchWindowException, TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+
+# ---------- Configuration ----------
+_DEFAULT_TIMEOUT = 30  # seconds
+_HTML_DIR = Path("html_captures")
+_LOG_DEBUG_DIR = Path("logs/debug")
+
+_FIREFOX_BIN = os.getenv("FIREFOX_BIN") or None
+_GECKO_PATH = os.getenv("GECKODRIVER_PATH") or None
+_HEADLESS = (os.getenv("FIREFOX_HEADLESS") == "1")
+
+# Persistent profile envs
+_ENV_PERSIST = (os.getenv("FIREFOX_PROFILE_PERSIST") == "1")
+_ENV_PROFILE_DIR = os.getenv("FIREFOX_PROFILE_DIR") or None
+_ENV_PROFILE_NAME = os.getenv("FIREFOX_PROFILE_NAME") or None
+_ENV_PROFILE_BASE = Path(os.getenv("FIREFOX_PROFILE_BASE_DIR") or ".selenium-profiles")
+
+
+SEED_URLS = [
+    "https://www.wikipedia.org/",
+    "https://www.bbc.com/news",
+    "https://www.nytimes.com/",
+    "https://www.reddit.com/",
+    "https://weather.com/",
+]
+
+# ---------- Filesystem helpers ----------
+def _ensure_dirs() -> None:
+    _HTML_DIR.mkdir(parents=True, exist_ok=True)
+    _LOG_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_for_filename(s: str, maxlen: int = 128) -> str:
+    """Conservative filename sanitizer."""
+    s = re.sub(r"^https?://", "", s)
+    s = re.sub(r"[\/\?\:\&\=\#\%\\\*\|\<\>\"]+", "_", s)
+    s = s.strip(" ._")
+    return s[:maxlen] if len(s) > maxlen else s
+
+
+def write_html_to_file(html: str, file_name: str) -> Path:
+    """Write raw HTML to html_captures, return Path."""
+    _ensure_dirs()
+    out = _HTML_DIR / file_name
+    out.write_text(html, encoding="utf-8")
+    return out
+
+
+def write_soup_to_file(soup: BeautifulSoup, file_name: str) -> Path:
+    """Write pretty HTML to html_captures, return Path."""
+    return write_html_to_file(soup.prettify(), file_name)
+
+
+# ---------- Internal profile resolver ----------
+def _resolve_profile(
+    persist_profile: bool | None,
+    profile_name: str | None,
+    profile_dir: str | Path | None,
+) -> tuple[Path, bool, bool]:
+    """
+    Decide which profile directory to use.
+
+    Returns:
+      (profile_path, is_persistent, is_temporary)
+    """
+    # Explicit args take precedence; otherwise env; otherwise temp.
+    arg_persist = bool(persist_profile) if persist_profile is not None else None
+
+    # 1) If a specific directory is given/ENVed, use it and mark persistent
+    chosen_dir: Path | None = None
+    if profile_dir:
+        chosen_dir = Path(profile_dir)
+        is_persistent = True
+    elif _ENV_PROFILE_DIR:
+        chosen_dir = Path(_ENV_PROFILE_DIR)
+        is_persistent = True
+    else:
+        # 2) If a name is given/ENVed, build under base and mark persistent
+        name = profile_name or _ENV_PROFILE_NAME
+        if name:
+            chosen_dir = _ENV_PROFILE_BASE / name
+            is_persistent = True
+        else:
+            # 3) Otherwise, temp throwaway
+            tmp = tempfile.mkdtemp(prefix="ff-profile-")
+            chosen_dir = Path(tmp)
+            is_persistent = False
+
+    # arg_persist can force persistent behavior (but never force-delete a named/explicit dir)
+    if arg_persist is not None:
+        if arg_persist:
+            is_persistent = True
+        else:
+            # Only allow forcing non-persistent if we were going to temp anyway
+            if is_persistent and (profile_dir or profile_name or _ENV_PROFILE_DIR or _ENV_PROFILE_NAME or _ENV_PERSIST):
+                # Ignore the force-off in this scenario to avoid deleting user dirs.
+                pass
+
+    # ENV_PERSIST can flip a temp into persistent (by simply not deleting later)
+    if _ENV_PERSIST:
+        is_persistent = True
+
+    chosen_dir.mkdir(parents=True, exist_ok=True)
+    is_temporary = not is_persistent and chosen_dir.name.startswith("ff-profile-")
+    return chosen_dir, is_persistent, is_temporary
+
+
+# ---------- Driver lifecycle ----------
+@contextmanager
+def start_driver(
+    *,
+    headless: bool | None = None,
+    page_load_timeout: int = _DEFAULT_TIMEOUT,
+    persist_profile: bool | None = None,
+    profile_name: str | None = None,
+    profile_dir: str | Path | None = None,
+) -> webdriver.Firefox:
+    """
+    Start a Firefox WebDriver with either:
+      - default throwaway temporary profile (deleted on exit), or
+      - persistent profile (reused across runs) if requested via args or env.
+
+    Args:
+      headless: override env; if None uses FIREFOX_HEADLESS env.
+      page_load_timeout: int seconds.
+      persist_profile: True to reuse profile across runs; False to always temp.
+      profile_name: logical name under FIREFOX_PROFILE_BASE_DIR (".selenium-profiles/<name>").
+      profile_dir: absolute path to a specific profile directory (overrides profile_name).
+    """
+    _ensure_dirs()
+
+    profile_path, is_persistent, is_temporary = _resolve_profile(
+        persist_profile=persist_profile, profile_name=profile_name, profile_dir=profile_dir
+    )
+    logging.info("Firefox profile: %s (%s)", profile_path, "persistent" if is_persistent else "temporary")
+
+    # Options
+    opts = FirefoxOptions()
+    if headless if headless is not None else _HEADLESS:
+        opts.add_argument("-headless")
+
+    # Optional custom Firefox binary
+    if _FIREFOX_BIN:
+        opts.binary_location = _FIREFOX_BIN
+
+    # Use our profile dir explicitly
+    opts.add_argument("-profile")
+    opts.add_argument(str(profile_path))
+
+    # Preferences (downloads, noisiness)
+    downloads_dir = str(Path(profile_path, "downloads"))
+    os.makedirs(downloads_dir, exist_ok=True)
+    opts.set_preference("browser.download.folderList", 2)
+    opts.set_preference("browser.download.dir", downloads_dir)
+    opts.set_preference("browser.download.useDownloadDir", True)
+    opts.set_preference("browser.helperApps.neverAsk.saveToDisk", "text/csv,application/octet-stream,application/pdf,text/plain")
+    opts.set_preference("pdfjs.disabled", True)
+    opts.set_preference("dom.webnotifications.enabled", False)
+    opts.set_preference("general.useragent.updates.enabled", False)
+    opts.set_preference("datareporting.healthreport.uploadEnabled", False)
+
+    # Service: prefer explicit geckodriver path if provided; else Selenium Manager
+    service = FirefoxService(executable_path=_GECKO_PATH) if _GECKO_PATH else FirefoxService()
+
+    driver = None
+    try:
+        driver = webdriver.Firefox(options=opts, service=service)
+        # Attach a hint so callers can introspect which profile was used (optional)
+        try:
+            setattr(driver, "_profile_dir", str(profile_path))
+            setattr(driver, "_profile_persistent", bool(is_persistent))
+        except Exception:
+            pass
+
+        driver.set_page_load_timeout(page_load_timeout)
+        yield driver
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception as e:
+                logging.warning("Error quitting driver: %s", e)
+
+        # Only remove temp throwaway profiles; never delete persistent ones
+        if not is_persistent and is_temporary:
+            try:
+                shutil.rmtree(profile_path, ignore_errors=True)
+            except Exception as e:
+                logging.warning("Error removing temp profile dir: %s", e)
+
+
+# ---------- Driver warmup + context manager ----------
+@contextmanager
+def spinup_driver(
+    headless: bool = False,
+    page_load_timeout: int = 30,
+    persist_profile: bool | None = None,
+    profile_name: str | None = None,
+    profile_dir: str | Path | None = None,
+):
+    cm = start_driver(
+        headless=headless,
+        page_load_timeout=page_load_timeout,
+        persist_profile=persist_profile,
+        profile_name=profile_name,
+        profile_dir=profile_dir,
+    )
+    driver = cm.__enter__()
+    try:
+        # warmup visits
+        for url in random.sample(SEED_URLS, k=3):
+            try:
+                driver.get(url)
+                time.sleep(random.uniform(2, 4))
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+                time.sleep(random.uniform(1, 2))
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(random.uniform(1, 2))
+            except Exception as e:
+                logging.warning(f"⚠️ Failed visiting {url}: {e}")
+        yield driver
+    finally:
+        cm.__exit__(None, None, None)
+
+# ---------- Page → Soup ----------
+def get_soup_from_url(
+    driver: webdriver.Firefox,
+    url: str,
+    *,
+    wait_css: tuple[By, str] | None = None,
+    timeout: int = 12,
+    extra_settle_seconds: float = 0.0,
+) -> BeautifulSoup | None:
+    """
+    Navigate to URL and return BeautifulSoup of page_source after a basic wait.
+
+    - wait_css: (By.<KIND>, "selector") to wait for; defaults to body presence.
+    - timeout: max seconds to wait for the selector.
+    - extra_settle_seconds: post-wait sleep to let SPA content settle (optional).
+    """
+    try:
+        driver.get(url)
+        locator = wait_css or (By.TAG_NAME, "body")
+        WebDriverWait(driver, timeout).until(EC.presence_of_element_located(locator))
+        if extra_settle_seconds > 0:
+            time.sleep(extra_settle_seconds)
+        return BeautifulSoup(driver.page_source, "html.parser")
+    except NoSuchWindowException:
+        print(f"❌ Firefox window closed unexpectedly while loading {url}. Not retrying.")
+        return None
+    except (TimeoutException, WebDriverException) as e:
+        print(f"WebDriver error while loading {url}: {e}")
+        return None
+
+
+# ---------- Convenience capture ----------
+def save_page_html(
+    driver: webdriver.Firefox,
+    url: str,
+    *,
+    timeout: int = 12,
+    extra_settle_seconds: float = 0.0,
+) -> dict:
+    """
+    High-level helper:
+    - loads the URL
+    - returns dict with paths to both debug and capture files plus soup.
+
+    Returns:
+      {
+        "soup": BeautifulSoup | None,
+        "debug_path": Path | None,
+        "capture_path": Path | None,
+      }
+    """
+    from datetime import datetime
+
+    soup = get_soup_from_url(driver, url, timeout=timeout, extra_settle_seconds=extra_settle_seconds)
+    if soup is None:
+        return {"soup": None, "debug_path": None, "capture_path": None}
+
+    html = str(soup)
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base = sanitize_for_filename(url)
+
+    debug_path = (_LOG_DEBUG_DIR / f"{ts}__{base}.html")
+    debug_path.write_text(html, encoding="utf-8")
+
+    capture_path = write_html_to_file(html, f"{base}.html")
+    return {"soup": soup, "debug_path": debug_path, "capture_path": capture_path}
+```
+
+---
+
+# 🚀 Use it with your Luma bot
+
+## Option A — No code changes: set env vars once
+
+```powershell
+setx FIREFOX_PROFILE_PERSIST 1
+setx FIREFOX_PROFILE_NAME luma_bot
+```
+
+Now both:
+
+```powershell
+# 1) interactive sign-in run (non-headless)
+.\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 3
+
+# 2) scheduled/headless runs reuse the same profile
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland" --headless
+```
+
+## Option B — Pass args in code (explicit)
+
+In `luma_bot/setup_driver_session.py`, change:
+
+```python
+with start_driver() as driver:
+```
+
+to:
+
+```python
+with start_driver(persist_profile=True, profile_name="luma_bot") as driver:
+```
+
+In `luma_bot/register_events.py`, change:
+
+```python
+with start_driver() as driver:
+```
+
+to:
+
+```python
+with start_driver(headless=args.headless, persist_profile=True, profile_name="luma_bot") as driver:
+```
+
+Both approaches are interoperable; other scrapers keep using ephemeral profiles by default.
+
+---
+
+# 📝 Notes
+
+* First run should be **non-headless** to complete Luma + Google sign-ins (via your `setup_driver_session.py`). After that, headless is fine.
+* The persistent profile lives at:
+
+  * `.selenium-profiles/luma_bot` (if you used `profile_name`), or
+  * your custom `FIREFOX_PROFILE_DIR` path.
+* We only delete the profile when it’s a temp throwaway. Persistent profiles are never removed by `driver_session`.
+
+If you want, I can also push the tiny **two-line edits** to `setup_driver_session.py` and `register_events.py` verbatim.
+
+-------------------------------------------------------------------------------
+
+I pushed the edits myself, but I still need instructions for using the luma_bot/setup_driver_session.py; on the new run it wasn't called
+
+-------------------------------------------------------------------------------
+
+Gotcha — `setup_driver_session.py` doesn’t run automatically. It’s a **one-time (or as-needed) step you call explicitly** to do the human sign-ins, then it hands off to `register_events.py`.
+
+Here’s exactly how to use it.
+
+# Quick start (PowerShell)
+
+1. **Enable a persistent Firefox profile** (so your logins stick):
+
+```powershell
+# one-time machine/user setup
+setx FIREFOX_PROFILE_PERSIST 1
+setx FIREFOX_PROFILE_NAME luma_bot
+```
+
+2. **Run the setup script non-headless** (so you can sign in):
+
+```powershell
+# from your repo root
+.\.venv\Scripts\python.exe .\luma_bot\setup_driver_session.py --cities "seattle" --max-per-city 3
+```
+
+What happens:
+
+* A Firefox window opens to **Luma** → you sign in → press Enter in the console.
+* Then it opens **Google Calendar** → sign in (same account as in `calendars.json`) → press Enter.
+* The setup window closes and the script **automatically launches** `register_events.py` with the same args you passed (`--cities`, `--max-per-city`, `--headless` if you add it).
+
+3. **Subsequent runs** (headless is fine now; same persistent profile):
+
+```powershell
+.\.venv\Scripts\python.exe .\luma_bot\register_events.py --cities "seattle,portland" --headless
+```
+
+# Common “why didn’t it run?” fixes
+
+* You ran `register_events.py` directly. That’s fine after you’ve done the setup once. If you still weren’t logged in, run `setup_driver_session.py` explicitly as shown above.
+* You used a different profile name. Make sure both runs use the **same** profile (env vars above, or pass `persist_profile=True, profile_name="luma_bot"` in your `start_driver()` calls).
+* You tried setup headless. Don’t — you won’t see the login UI. Do the first setup **non-headless**.
+* You expected your wrapper to call setup. It won’t unless you wire it. See below.
+
+# Optional: wire setup into your PowerShell wrapper
+
+If you want a “do setup first” switch in `scripts/run-luma-bot.ps1`, add a flag and call the setup script:
+
+```powershell
+param(
+  [Parameter(Mandatory = $true)] [string]$Cities,
+  [string]$RepoRoot = ".",
+  [string]$VenvPath = ".\.venv\Scripts\python.exe",
+  [string]$ProfileJson = "luma_bot\profile.json",
+  [int]$MaxPerCity = 0,
+  [switch]$Headless,
+  [switch]$SetupFirst   # <— add this
+)
+
+Set-Location -Path $RepoRoot
+
+if ($SetupFirst) {
+  $setupArgs = @("--cities", $Cities)
+  if ($MaxPerCity -gt 0) { $setupArgs += @("--max-per-city", "$MaxPerCity") }
+  # NOTE: setup script performs the handoff to register_events for you.
+  & $VenvPath "luma_bot\setup_driver_session.py" @setupArgs
+  exit $LASTEXITCODE
+}
+
+# normal direct run
+$argList = @("--cities", $Cities, "--profile-json", $ProfileJson)
+if ($MaxPerCity -gt 0) { $argList += @("--max-per-city", "$MaxPerCity") }
+if ($Headless) { $argList += "--headless" }
+& $VenvPath "luma_bot\register_events.py" @argList
+exit $LASTEXITCODE
+```
+
+Usage:
+
+```powershell
+# first time (does interactive logins, then runs the bot)
+powershell -ExecutionPolicy Bypass -File .\scripts\run-luma-bot.ps1 -Cities "seattle" -SetupFirst
+
+# later (headless)
+powershell -ExecutionPolicy Bypass -File .\scripts\run-luma-bot.ps1 -Cities "seattle,portland" -Headless
+```
+
+# Sanity check that logins “stuck”
+
+* After the setup run finishes, start a new run of `register_events.py` (headless or not).
+* If it’s still acting logged-out: confirm the env vars are set (new shell needed after `setx`), or pass `persist_profile=True, profile_name="luma_bot"` in your `start_driver()` calls.
+
+If anything still feels off, paste the exact command you ran + console output and I’ll zero in on it.
+
+-------------------------------------------------------------------------------
+
+I feel like we should add all these generated files to .gitignore
+
+-------------------------------------------------------------------------------
+
+**Edited files**
+
+* `.gitignore` (new/updated)
+
+Here’s a ready-to-drop **.gitignore** that covers everything this bot generates (logs, debug HTML, Selenium profiles, de-dupe DB, downloads), plus standard Python/OS/IDE noise. It also ignores your **real config files** and encourages checking in safe `*.example.json` templates instead.
+
+```gitignore
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+.installed.cfg
+*.manifest
+*.spec
+pip-wheel-metadata/
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage*
+htmlcov/
+
+# =========================
+# OS cruft
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Editors/IDEs
+# =========================
+.vscode/
+.idea/
+*.code-workspace
+
+# =========================
+# Selenium profiles & temp profiles
+# (persistent profile lives here if you used FIREFOX_PROFILE_NAME=luma_bot)
+# =========================
+.selenium-profiles/
+ff-profile-*/
+
+# Firefox download subfolders (when using temp profiles)
+**/downloads/
+
+# =========================
+# Bot artifacts
+# =========================
+# Debug HTML & logs
+html_captures/
+logs/
+logs/**
+
+# Luma-bot runtime data (registered events de-dupe store)
+luma_bot/data/
+luma_bot/data/**
+
+# If you want to keep example configs checked in, ignore the real ones:
+luma_bot/profile.json
+luma_bot/calendars.json
+
+# Optionally allow example templates
+!luma_bot/profile.example.json
+!luma_bot/calendars.example.json
+
+# =========================
+# Misc
+# =========================
+*.log
+*.tmp
+*.swp
+*.bak
+```
+
+### Recommended follow-ups (one time)
+
+1. Keep **sanitized templates** in git:
+
+   * `luma_bot/profile.example.json`
+   * `luma_bot/calendars.example.json`
+2. Keep your real, private configs untracked:
+
+   * `luma_bot/profile.json`
+   * `luma_bot/calendars.json`
+
+If you’ve already committed any of the ignored files, run:
+
+```bash
+git rm -r --cached html_captures logs luma_bot/data luma_bot/profile.json luma_bot/calendars.json .selenium-profiles
+git commit -m "chore(gitignore): stop tracking generated artifacts and private configs"
+```
+
+Want me to spit out `profile.example.json` and `calendars.example.json` with placeholders next? I can draft them to match what the bot expects.
+
+---
+
+**Conventional Commit**
+
+chore(gitignore): ignore selenium profiles, logs, debug html, luma data, and private configs; keep example templates tracked
+
 
 -------------------------------------------------------------------------------
 

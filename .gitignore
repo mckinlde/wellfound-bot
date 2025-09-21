@@ -1,3 +1,86 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+.installed.cfg
+*.manifest
+*.spec
+pip-wheel-metadata/
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.coverage*
+htmlcov/
+
+# =========================
+# OS cruft
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Editors/IDEs
+# =========================
+.vscode/
+.idea/
+*.code-workspace
+
+# =========================
+# Selenium profiles & temp profiles
+# (persistent profile lives here if you used FIREFOX_PROFILE_NAME=luma_bot)
+# =========================
+.selenium-profiles/
+ff-profile-*/
+
+# Firefox download subfolders (when using temp profiles)
+**/downloads/
+
+# =========================
+# Bot artifacts
+# =========================
+# Debug HTML & logs
+html_captures/
+logs/
+logs/**
+
+# Luma-bot runtime data (registered events de-dupe store)
+luma_bot/data/
+luma_bot/data/**
+
+# If you want to keep example configs checked in, ignore the real ones:
+luma_bot/profile.json
+luma_bot/calendars.json
+
+# Optionally allow example templates
+!luma_bot/profile.example.json
+!luma_bot/calendars.example.json
+
+# =========================
+# Misc
+# =========================
+*.log
+*.tmp
+*.swp
+*.bak
+
+
 # Logs
 *.log
 

@@ -23,7 +23,7 @@ except Exception:
     scroll_into_view = None
 
 
-CONFIG_PATH = Path("luma-bot/calendars.json")
+CONFIG_PATH = Path("luma_bot/calendars.json")
 
 DEFAULT_WAIT = 20
 LONG_WAIT = 45

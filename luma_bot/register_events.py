@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import re
 import argparse
 import json
 import sys
@@ -33,7 +33,7 @@ from luma_bot.logger import BotLogger
 BASE = "https://luma.com"
 CITY_URL = "https://luma.com/{city}"
 
-DATA_DIR = Path("luma-bot/data")
+DATA_DIR = Path("luma_bot/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 REGISTERED_DB = DATA_DIR / "registered_events.json"  # simple de-dupe store
 
@@ -48,57 +48,104 @@ def save_json(path: Path, data) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def robust_scroll_to_bottom(driver, quiet_secs: float = 1.25, max_rounds: int = 50):
-    """
-    Fallback scroll in case SPA_utils isn't present. Scrolls until height stops changing.
-    """
-    if spa_scroll_to_bottom:
-        # Use user’s helper if available
-        spa_scroll_to_bottom(driver)
-        return
-
-    last_height = -1
-    rounds = 0
-    while rounds < max_rounds:
-        height = driver.execute_script("return document.body.scrollHeight")
-        if height == last_height:
-            time.sleep(quiet_secs)
-            height2 = driver.execute_script("return document.body.scrollHeight")
-            if height2 == height:
-                break
+def robust_scroll_to_bottom(driver, quiet_secs: float = 1.0, max_rounds: int = 60):
+    last_height = 0
+    rounds_same = 0
+    for _ in range(max_rounds):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(quiet_secs)
+        height = driver.execute_script("return document.body.scrollHeight")
+        if height == last_height:
+            rounds_same += 1
+            if rounds_same >= 2:
+                break
+        else:
+            rounds_same = 0
         last_height = height
-        rounds += 1
+
+    # Try a 'Load more' if present
+    try:
+        btns = driver.find_elements(By.XPATH, "//button[contains(., 'Load more') or contains(., 'Show more')]")
+        if btns:
+            btns[0].click()
+            time.sleep(1.5)
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(quiet_secs)
+    except Exception:
+        pass
 
 
 def collect_city_event_links(driver) -> List[str]:
     """
-    Collects candidate event links from a city listing page.
-    We intentionally over-collect then de-dupe + validate.
+    Collect candidate event links from a city listing page.
+
+    Luma event URLs are usually short slugs like:
+      https://luma.com/yu2ccnvr  or  https://lu.ma/tnogkouo
+    (no '/event' or '/events' segment). This collector accepts:
+      • absolute luma.com / lu.ma single-segment paths
+      • '/event/...', '/e/...' (older patterns)
+      • relative versions of the above
     """
+
+    def looks_like_event_url(href: str) -> bool:
+        if not href or href.startswith(("mailto:", "tel:")):
+            return False
+
+        # Absolute short slug or /event|/e/ style
+        if re.match(r"^https?://(luma\.com|lu\.ma)/[A-Za-z0-9_-]{4,}$", href):
+            return True
+        if re.match(r"^https?://(luma\.com|lu\.ma)/(event|e)/.+", href):
+            return True
+
+        # Relative versions
+        if href.startswith("/"):
+            path = href.split("?")[0].strip("/")
+            parts = path.split("/")
+            blocked = {"discover", "help", "pricing", "host", "login", "signup", "map"}
+            if len(parts) == 1 and parts[0] and parts[0] not in blocked and len(parts[0]) >= 4:
+                return True
+            if parts and parts[0] in {"event", "e"} and len(parts) > 1:
+                return True
+
+        return False
+
     anchors = driver.find_elements(By.CSS_SELECTOR, "a[href]")
-    links: Set[str] = set()
+    matched: List[str] = []
+
     for a in anchors:
         try:
             href = a.get_attribute("href") or ""
-            if not href:
+            if looks_like_event_url(href):
+                netloc = urlparse(href).netloc
+                if "lumacdn.com" in netloc:
+                    continue  # skip CDN images
+                matched.append(href)
                 continue
-            # Accept obvious event-ish links
-            # We allow both absolute and site-relative
-            if "/event" in href or "/events" in href or "/e/" in href:
-                links.add(href)
+
+            # Try relative hrefs
+            if href.startswith("/") and looks_like_event_url(BASE.rstrip("/") + href):
+                matched.append(BASE.rstrip("/") + href)
         except StaleElementReferenceException:
             continue
-    # Normalize: ensure absolute URLs to luma.com
-    normalized = []
-    for href in links:
-        parsed = urlparse(href)
-        if not parsed.netloc:
-            normalized.append(BASE.rstrip("/") + "/" + href.lstrip("/"))
-        else:
-            normalized.append(href)
-    return sorted(set(normalized))
+
+    # Fallback: some cards are clickable containers; grab the nearest ancestor with href/data-href
+    if not matched:
+        cards = driver.find_elements(
+            By.XPATH, "//h3/ancestor::*[self::a or @role='link' or @data-href][1]"
+        )
+        for el in cards:
+            try:
+                href = el.get_attribute("href") or el.get_attribute("data-href") or ""
+                if href and looks_like_event_url(href):
+                    if href.startswith("/"):
+                        href = BASE.rstrip("/") + href
+                    matched.append(href)
+            except StaleElementReferenceException:
+                continue
+
+    matched = sorted(set(matched))
+    print(f"[DEBUG] Anchors: {len(anchors)}, event-like: {len(matched)}")
+    return matched
 
 
 def is_free_event_on_page(driver) -> bool:
@@ -301,7 +348,7 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--profile-json",
-        default=str(Path("luma-bot/profile.json")),
+        default=str(Path("luma_bot/profile.json")),
         help="Path to profile.json used by form_filler.py (if it loads dynamically)",
     )
     p.add_argument(
@@ -334,7 +381,7 @@ def main(argv: Iterable[str] = None):
     # If your start_driver() supports headless config, pass it here; otherwise ignore.
     # Example: with start_driver(headless=args.headless) as driver:
     try:
-        with start_driver() as driver:
+        with start_driver(headless=args.headless, persist_profile=True, profile_name="luma_bot") as driver:
             for city in cities:
                 process_city(driver, city, logger, max_events=args.max_per_city)
     except KeyboardInterrupt:
