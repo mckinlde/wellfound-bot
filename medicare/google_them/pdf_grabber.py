@@ -25,14 +25,6 @@ from urllib.parse import urlparse
 # ---------------------------
 
 LOG_FILE = "medicare/google_them/google_pdf_grabber.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger("pdf_grabber")
 
 DOC_TYPES = {
@@ -120,10 +112,14 @@ def api_search_and_categorize(plan_id, plan_name, label="broad", pages=3):
     for page in range(pages):
         start_index = page * 10 + 1
         results = run_search(query, max_results=10, start_index=start_index)
+        logger.debug(f"[DEBUG] {plan_id} {label} page {page+1}: {len(results)} results")
         for url, title, snippet in results:
+            logger.debug(f"[DEBUG] Candidate link: {url} | title={title!r} | snippet={snippet!r}")
             if not is_pdf_url(url):
                 continue
             doc_label = categorize_link(url, f"{title} {snippet}")
+            if doc_label:
+                logger.debug(f"[DEBUG] Categorized {url} as {doc_label}")
             if doc_label and doc_label not in found:
                 found[doc_label] = url
             if len(found) == 3:
@@ -163,7 +159,15 @@ def main():
     ap.add_argument("--start", type=int, default=1)
     ap.add_argument("--stop", type=int, default=None, help="Inclusive 1-based stop index")
     ap.add_argument("--pages", type=int, default=3, help="Max API pages per query (default: 3)")
+    ap.add_argument("--debug", action="store_true", help="Enable debug logging for detailed trace")
     args = ap.parse_args()
+
+    # Configure logging level
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logger.setLevel(log_level)
+    # Reconfigure root handlers with new level
+    for h in logger.handlers:
+        h.setLevel(log_level)
 
     os.makedirs(args.outdir, exist_ok=True)
 
