@@ -711,7 +711,7 @@ def main():
             batch_count += 1
 
             # --- forced cooldown on consecutive failures ---
-            if consecutive_failures >= 5:
+            if consecutive_failures >= 50:
                 batch_id += 1
                 elapsed = int(time.time() - batch_start_time)
                 consecutive_block_batches += 1
