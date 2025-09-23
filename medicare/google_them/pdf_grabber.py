@@ -129,9 +129,7 @@ def api_search_and_categorize(plan_id, plan_name, label="broad", pages=3):
             if len(found) == 3:
                 break
         polite_sleep()
-    print(f"[API SEARCH] {plan_id} {label} → {len(found)} categorized")
     logger.info(f"[API SEARCH] {plan_id} {label} → {len(found)} categorized")
-    
     return found
 
 def download_pdf(session, url, dest_path, plan_id, doc_label):
@@ -139,9 +137,7 @@ def download_pdf(session, url, dest_path, plan_id, doc_label):
     if not url:
         return False
     if os.path.exists(dest_path):
-        print(f"[SKIP] {doc_label} already exists for {plan_id} → {dest_path}")
         logger.info(f"[SKIP] {doc_label} already exists for {plan_id} → {dest_path}")
-        
         return True
     try:
         r = session.get(url, stream=True, timeout=30)
@@ -149,14 +145,10 @@ def download_pdf(session, url, dest_path, plan_id, doc_label):
         with open(dest_path, "wb") as f:
             for chunk in r.iter_content(8192):
                 f.write(chunk)
-        print(f"[DOWNLOAD] Saved {doc_label} for {plan_id} → {dest_path}")
         logger.info(f"[DOWNLOAD] Saved {doc_label} for {plan_id} → {dest_path}")
-        
         return True
     except Exception as e:
-        print(f"[ERROR] Failed {url}: {e}")
         logger.error(f"[ERROR] Failed {url}: {e}")
-        
         return False
 
 # ---------------------------
@@ -218,7 +210,6 @@ def main():
             "formulary_pdf_filepath": "",
         }
 
-        print(f"[INFO] ({idx}/{total}) Searching PDFs for {plan_id} {plan_name}")
         logger.info(f"[INFO] ({idx}/{total}) Searching PDFs for {plan_id} {plan_name}")
 
         # 1) Broad search
@@ -250,7 +241,6 @@ def main():
             "EoC=" + ("FOUND" if row["EoC_pdf_link"] else "NOT FOUND"),
             "Formulary=" + ("FOUND" if row["formulary_pdf_link"] else "NOT FOUND"),
         ]
-        print(f"[SUMMARY] ({idx}/{total}) {plan_id} → {', '.join(summary_bits)}")
         logger.info(f"[SUMMARY] ({idx}/{total}) {plan_id} → {', '.join(summary_bits)}")
 
         out_writer.writerow(row)
