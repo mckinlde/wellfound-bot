@@ -7,6 +7,7 @@ Stages:
 2) For each plan, run a broad API query for PDFs
 3) If missing doc types, run targeted API queries
 4) Download PDFs, log results into CSV
+5) (Optional --debug) Save raw JSON responses for offline analysis
 """
 
 import os
@@ -93,15 +94,12 @@ def run_search(query, max_results=10, start_index=1):
     }
     r = requests.get(SEARCH_URL, params=params, timeout=30)
     r.raise_for_status()
-    data = r.json()
-    items = []
-    for item in data.get("items", []):
-        items.append((item.get("link", ""), item.get("title", ""), item.get("snippet", "")))
-    return items
+    return r.json()
 
-def api_search_and_categorize(plan_id, plan_name, label="broad", pages=3):
+def api_search_and_categorize(plan_id, plan_name, label="broad", pages=3, debug_dir=None):
     """
     Use API search to return dict of doc_label → url.
+    Saves raw JSON to debug_dir if provided.
     """
     if label == "broad":
         query = f"{plan_id} {plan_name} filetype:pdf"
@@ -111,9 +109,22 @@ def api_search_and_categorize(plan_id, plan_name, label="broad", pages=3):
     found = {}
     for page in range(pages):
         start_index = page * 10 + 1
-        results = run_search(query, max_results=10, start_index=start_index)
-        logger.debug(f"[DEBUG] {plan_id} {label} page {page+1}: {len(results)} results")
-        for url, title, snippet in results:
+        data = run_search(query, max_results=10, start_index=start_index)
+
+        # Save debug JSON if enabled
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, f"{plan_id}_{label}_page{page+1}.json")
+            with open(debug_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            logger.debug(f"[DEBUG] Saved raw JSON → {debug_file}")
+
+        items = []
+        for item in data.get("items", []):
+            items.append((item.get("link", ""), item.get("title", ""), item.get("snippet", "")))
+
+        logger.debug(f"[DEBUG] {plan_id} {label} page {page+1}: {len(items)} results")
+        for url, title, snippet in items:
             logger.debug(f"[DEBUG] Candidate link: {url} | title={title!r} | snippet={snippet!r}")
             if not is_pdf_url(url):
                 continue
@@ -159,15 +170,26 @@ def main():
     ap.add_argument("--start", type=int, default=1)
     ap.add_argument("--stop", type=int, default=None, help="Inclusive 1-based stop index")
     ap.add_argument("--pages", type=int, default=3, help="Max API pages per query (default: 3)")
-    ap.add_argument("--debug", action="store_true", help="Enable debug logging for detailed trace")
+    ap.add_argument("--debug", action="store_true", help="Enable debug logging and save raw JSON")
     args = ap.parse_args()
 
     # Configure logging level
     log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
+            logging.StreamHandler()
+        ]
+    )
     logger.setLevel(log_level)
-    # Reconfigure root handlers with new level
-    for h in logger.handlers:
-        h.setLevel(log_level)
+
+    # Debug directory for raw API JSONs
+    debug_dir = None
+    if args.debug:
+        debug_dir = os.path.join(args.outdir, "debug_json")
+        os.makedirs(debug_dir, exist_ok=True)
 
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -217,7 +239,7 @@ def main():
         logger.info(f"[INFO] ({idx}/{total}) Searching PDFs for {plan_id} {plan_name}")
 
         # 1) Broad search
-        broad_found = api_search_and_categorize(plan_id, plan_name, label="broad", pages=args.pages)
+        broad_found = api_search_and_categorize(plan_id, plan_name, label="broad", pages=args.pages, debug_dir=debug_dir)
         for doc_label, pdf_url in broad_found.items():
             dest_path = os.path.join(args.outdir, f"{plan_id}_{doc_label}.pdf")
             ok = download_pdf(session, pdf_url, dest_path, plan_id, doc_label)
@@ -229,7 +251,7 @@ def main():
         # 2) Targeted search for missing
         missing_labels = [d for d in DOC_TYPES.keys() if d not in broad_found]
         for doc_label in missing_labels:
-            res = api_search_and_categorize(plan_id, plan_name, label=doc_label, pages=args.pages)
+            res = api_search_and_categorize(plan_id, plan_name, label=doc_label, pages=args.pages, debug_dir=debug_dir)
             pdf_url = res.get(doc_label, "")
             if pdf_url:
                 dest_path = os.path.join(args.outdir, f"{plan_id}_{doc_label}.pdf")
