@@ -1193,9 +1193,82 @@ def load_plan_details(csv_path="medicare/humana/humana_plan_links.csv"):
 
 -------------------------------------------------------------------------------
 
--------------------------------------------------------------------------------
+I found a SPA navigation problem, I need to switch the tab to "all plans" on the plan list page:
+<nucleus-tabs data-v-b8a65025="" tab-type="page-level" current-tab="0"><nucleus-tab data-v-b8a65025="" slot="tab" data-restart="" role="tab" id="mxem815-tab-0" aria-selected="true" tab-type="page-level" title="Matched plans" aria-controls="mxem815-content-0">Matched plans</nucleus-tab><nucleus-tab data-v-b8a65025="" slot="tab" data-skip="" data-skip-to-plans="" role="tab" id="mxem815-tab-1" aria-selected="false" tab-type="page-level" title="(12)" aria-controls="mxem815-content-1"> All plans <span data-v-b8a65025="">(12)</span></nucleus-tab></nucleus-tabs>
 
 -------------------------------------------------------------------------------
+
+Good catch — Humana’s SPA defaults you into the **“Matched plans”** tab, and you need to explicitly switch to the **“All plans”** tab to see every plan (and the right `data-plan-id`s).
+
+Based on your snippet:
+
+```html
+<nucleus-tabs tab-type="page-level" current-tab="0">
+  <nucleus-tab slot="tab" data-restart ... title="Matched plans">Matched plans</nucleus-tab>
+  <nucleus-tab slot="tab" data-skip data-skip-to-plans ... title="(12)"> All plans <span>(12)</span></nucleus-tab>
+</nucleus-tabs>
+```
+
+the **All plans** tab can be targeted with `[data-skip-to-plans]`.
+
+---
+
+### 🔧 Patch for `scrape_plan_pdfs`
+
+Right after you scroll the plan list page but **before** you search for `div[data-plan-id=...]`, insert this:
+
+```python
+    # Switch to "All plans" tab if present
+    try:
+        all_plans_tab = driver.find_element(By.CSS_SELECTOR, "nucleus-tab[data-skip-to-plans]")
+        _safe_click_element(driver, all_plans_tab)
+        sleep(2.0)  # wait for content to refresh
+    except Exception:
+        pass  # if already in All plans or element missing
+```
+
+---
+
+### ✅ Why this works
+
+* `nucleus-tab[data-skip-to-plans]` uniquely selects the second tab.
+* Using `_safe_click_element` keeps consistency with your brittle SPA handling.
+* A short `sleep(2.0)` is needed because the SPA re-renders plan cards when switching tabs.
+* If the tab isn’t present (already on “All plans”), the `except` ensures it won’t break.
+
+---
+
+Would you like me to integrate this into the full `scrape_plan_pdfs()` function for you so you can copy-paste directly, or do you prefer the snippet to insert manually?
+
+-------------------------------------------------------------------------------
+
+New plan, it looks like the PDF links follow a standard format based on the plan ID:
+- https://www.humana-medicare.com/BenefitSummary/2025PDFs/H5619089000SB25.pdf
+- https://www.humana-medicare.com/BenefitSummary/2025PDFs/H5619089000EOC25.pdf
+- https://www.humana-medicare.com/BenefitSummary/2025PDFs/H5216368000SB25.pdf
+- https://www.humana-medicare.com/BenefitSummary/2025PDFs/H5216368000EOC25.pdf
+
+Let's just load all the planIDs from humana_plan_links.csv, translate them into viable links, and try to download the PDFs directly.
+
+In humana_plan_links.csv, the planID format is like:
+- H5619-089-0
+- H5216-368-0
+
+So the first two sections are concatenated, and the final section is 0-padded before being concatenated as well.  Notably, the final section is zero-padded from the left, so the planID
+- H5216-318-1
+would become
+- H5216318001
+and then have links
+- https://www.humana-medicare.com/BenefitSummary/2025PDFs/H5216318001SB25.pdf
+- https://www.humana-medicare.com/BenefitSummary/2025PDFs/H5216318001EOC25.pdf
+
+It makes sense to check for 2025 and 2024, so also these links:
+- https://www.humana-medicare.com/BenefitSummary/2024PDFs/H5216318001SB24.pdf
+- https://www.humana-medicare.com/BenefitSummary/2024PDFs/H5216318001EOC24.pdf
+- https://www.humana-medicare.com/BenefitSummary/2024PDFs/H5216318001SB24.pdf
+- https://www.humana-medicare.com/BenefitSummary/2024PDFs/H5216318001EOC24.pdf
+
+But we'll need to be able to detect which don't work.
 
 -------------------------------------------------------------------------------
 

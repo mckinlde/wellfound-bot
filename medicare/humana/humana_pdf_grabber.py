@@ -80,36 +80,43 @@ def scrape_plan_pdfs(driver, zip_code: str, plan_name: str, plan_id: str) -> dic
         # <button data-v-024a7d79="" class="nb-btn nb-btn--primary next" type="submit" data-next=""><span data-v-024a7d79="" class="nu-d-none md:nu-d-inline">Next</span><span data-v-024a7d79="" class="nu-d-flex md:nu-d-none">Next</span><!----><!----></button>
         wait_scroll_interact(driver, By.CSS_SELECTOR, 'button[type="submit"][data-next]', action="click", timeout=5)
         sleep(0.5)
+        # input("Enter to continue 1...")
         # then click the none applied checkbox
         # <nucleus-checkbox data-v-f4c10c2c="" class="inline-flex" name="noneApplies"> None of these apply to me </nucleus-checkbox>
         wait_scroll_interact(driver, By.CSS_SELECTOR, 'nucleus-checkbox[name="noneApplies"]', action="click", timeout=5)
         sleep(0.5)
+        # input("Enter to continue 2...")
         # then click next
         # <button data-v-024a7d79="" class="nb-btn nb-btn--primary next" type="submit" data-next=""><span data-v-024a7d79="" class="nu-d-none md:nu-d-inline">Next</span><span data-v-024a7d79="" class="nu-d-flex md:nu-d-none">Next</span><!----><!----></button>
         wait_scroll_interact(driver, By.CSS_SELECTOR, 'button[type="submit"][data-next]', action="click", timeout=5)
         sleep(0.5)
-        # then select open to all plans radio dial
-        # <nucleus-radio-button data-v-3603efc7="" data-open-to-all-plans="" class="coverage-detail is-selection-card selection-card plan-network-answer nucleus-radio-selection-card" name="openToAllPlans" value="true" style="padding: 0.5rem;"><div data-v-3603efc7="" class="medicine-center mb-3 w-100 nu-d-none md:nu-d-flex"><nucleus-icon data-v-3603efc7="" class="icon-large medicine-center"></nucleus-icon></div><div data-v-3603efc7="" class="coverage-detail-title">I am open to all plan networks</div><p data-v-3603efc7="" slot:description="" class="nu-d-none md:nu-d-inline">We’ll show you recommended plans regardless of provider network. If you are open to seeing an in-network doctor, we can recommend plans that may have lower out-of-pocket costs.</p></nucleus-radio-button>
-        wait_scroll_interact(driver, By.CSS_SELECTOR, 'nucleus-radio-button[value="true"]', action="click", timeout=5)
-        sleep(0.5)
-        # then click next
-        # <button data-v-024a7d79="" class="nb-btn nb-btn--primary next" type="submit" data-next=""><span data-v-024a7d79="" class="nu-d-none md:nu-d-inline">Next</span><span data-v-024a7d79="" class="nu-d-flex md:nu-d-none">Next</span><!----><!----></button>
-        wait_scroll_interact(driver, By.CSS_SELECTOR, 'button[type="submit"][data-next]', action="click", timeout=5)
-        sleep(0.5)
-        # then click skip this step
-        # <button data-v-024a7d79="" class="link" data-skip=""> Skip <span data-v-024a7d79="" class="nu-d-none md:nu-d-inline">this step</span></button>
+        # input("Enter to continue 3...")
+        # then skip selecting a plan type
         wait_scroll_interact(driver, By.CSS_SELECTOR, 'button[data-skip]', action="click", timeout=5)
         sleep(0.5)
-        # and the next skip this step
-        # <button data-v-024a7d79="" class="link" data-skip=""> Skip <span data-v-024a7d79="" class="nu-d-none md:nu-d-inline">this step</span></button>
+        # input("Enter to continue 4...")
+        # then skip adding doctors
+        wait_scroll_interact(driver, By.CSS_SELECTOR, 'button[data-skip]', action="click", timeout=5)
+        sleep(0.5)
+        # input("Enter to continue 5...")
+        # and skip adding prescriptions
         wait_scroll_interact(driver, By.CSS_SELECTOR, 'button[data-skip]', action="click", timeout=5)
         sleep(3.0)  # wait for page to load
     except Exception:
         pass  # if it doesn't appear, continue  
-    # Now we should be at the plan list page
+    
+    # Switch to "All plans" tab if present
+    try:
+        all_plans_tab = driver.find_element(By.CSS_SELECTOR, "nucleus-tab[data-skip-to-plans]")
+        _safe_click_element(driver, all_plans_tab)
+        sleep(2.0)  # wait for content to refresh
+    except Exception:
+        pass  # if already in All plans or element missing
+
     # After pageload, scroll down to the bottom to trigger lazy loading
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
     sleep(2.0)  # wait for lazy load
+    input("Enter to continue plan_list_page...")
     # Then find the div with matching plan_id
     # <div class="plan ma" id="" data-mfe-plancard="" data-plan-id="H5216-428-001-2025" data-list-medicare-plans="" idvpage="">
     plan_div = None
