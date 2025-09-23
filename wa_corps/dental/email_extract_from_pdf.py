@@ -4,7 +4,7 @@ from pathlib import Path
 import csv
 
 PDF_DIR = Path("wa_corps/dental/business_pdf")
-OUTPUT_FILE = Path("wa_corps/dental/emails_from_pdfs.csv")
+OUTPUT_FILE = Path("wa_corps/dental/emails_from_pdfs2.csv")
 
 EMAIL_REGEX = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
