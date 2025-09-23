@@ -44,12 +44,13 @@ DOC_LABELS = [
 
 
 def load_plan_details(csv_path="medicare/humana/humana_plan_links.csv"):
-    """Return list of (zip_code, plan_name, plan_id) tuples, deduplicated, CSV order preserved."""
+    """Return list of (zip, plan_name, plan_id) tuples, deduplicated, CSV order preserved."""
     df = pd.read_csv(csv_path, dtype=str)
 
-    # Drop exact duplicate rows across these three cols
-    df = df.drop_duplicates(subset=["zip_code", "plan_name", "plan_id"])
+    # normalize column names in case there's a mismatch
+    df = df.rename(columns={"zip": "zip_code"})
 
+    df = df.drop_duplicates(subset=["zip_code", "plan_name", "plan_id"])
     plans = list(df[["zip_code", "plan_name", "plan_id"]].itertuples(index=False, name=None))
     return plans
 

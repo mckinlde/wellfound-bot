@@ -1129,7 +1129,67 @@ Do you want me to also make the **retry hook optional via CLI flag** (e.g. `--no
 
 -------------------------------------------------------------------------------
 
+
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> & "C:/Users/mckin/OneDrive/Desktop/syncthing-folder/Git Repos/wellfound-bot/.venv/Scripts/python.exe" "c:/Users/mckin/OneDrive/Desktop/syncthing-folder/Git Repos/wellfound-bot/medicare/humana/humana_pdf_grabber.py"
+Could not find platform independent libraries <prefix>
+Traceback (most recent call last):
+  File "c:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\medicare\humana\humana_pdf_grabber.py", line 252, in <module>
+    main(start_n=args.start_n, stop_n=args.stop_n)     
+    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^     
+  File "c:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\medicare\humana\humana_pdf_grabber.py", line 197, in main
+    plans = load_plan_details()
+  File "c:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\medicare\humana\humana_pdf_grabber.py", line 51, in load_plan_details
+    df = df.drop_duplicates(subset=["zip_code", "plan_name", "plan_id"])
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\.venv\Lib\site-packages\pandas\core\frame.py", line 6825, in drop_duplicates        
+    result = self[-self.duplicated(subset, keep=keep)] 
+                   ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^  
+  File "C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot\.venv\Lib\site-packages\pandas\core\frame.py", line 6957, in duplicated
+    raise KeyError(Index(diff))
+KeyError: Index(['zip_code'], dtype='object')
+
 -------------------------------------------------------------------------------
+Ah, that traceback is clear:
+
+Your CSV doesn’t have a column named `zip_code`. It probably has `zip` (or something similar), since you started from the Aetna format.
+
+---
+
+### 🔧 Fix
+
+Update `load_plan_details()` to match the real column names in your `humana_plan_links.csv`.
+If the CSV looks like:
+
+```
+zip,plan_name,plan_id
+30301,HumanaChoice, H5216-428-001-2025
+...
+```
+
+then the function should be:
+
+```python
+def load_plan_details(csv_path="medicare/humana/humana_plan_links.csv"):
+    """Return list of (zip, plan_name, plan_id) tuples, deduplicated, CSV order preserved."""
+    df = pd.read_csv(csv_path, dtype=str)
+
+    # normalize column names in case there's a mismatch
+    df = df.rename(columns={"zip": "zip_code"})
+
+    df = df.drop_duplicates(subset=["zip_code", "plan_name", "plan_id"])
+    plans = list(df[["zip_code", "plan_name", "plan_id"]].itertuples(index=False, name=None))
+    return plans
+```
+
+---
+
+### ✅ Why this works
+
+* Renames the column once → all downstream code can consistently expect `zip_code`.
+* Still works even if the CSV already uses `zip_code` (the rename is harmless).
+
+---
+
+⚡ Question for you: do you want me to add a **CSV header check** that raises a friendly error if `zip/zip_code`, `plan_name`, or `plan_id` are missing, instead of throwing a pandas `KeyError`? That way you’d immediately know if the input file is malformed.
 
 -------------------------------------------------------------------------------
 
