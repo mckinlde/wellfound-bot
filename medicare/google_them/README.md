@@ -84,3 +84,6 @@ If some docs are still missing, fall back to specific searches (summary of benef
 Captcha handling with input() so you can solve it manually.
 
 Saves all result pages for debugging.
+
+
+----------- Switch to 3-stage pipeline ----------

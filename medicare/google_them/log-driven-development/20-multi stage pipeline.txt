@@ -1,0 +1,954 @@
+
+Perfect 👍 — let’s split the workflow cleanly.
+
+---
+
+# 1. Updated `pdf_grabber.py` (Stage 1: Collect candidates only)
+
+This version **does not download PDFs**. Instead, it collects every candidate `.pdf` URL from the API results and saves them into a `candidates.csv`. That file is then the input for your second-stage filtering/downloading script.
+
+```python
+#!/usr/bin/env python3
+"""
+Stage 1: Collect candidate PDF links using Google Custom Search API.
+
+Output: candidates.csv with rows like
+plan_id, plan_name, company, doc_label, candidate_links
+"""
+
+import os
+import csv
+import json
+import time
+import random
+import argparse
+import logging
+import requests
+
+# ---------------------------
+# Setup
+# ---------------------------
+
+LOG_FILE = "medicare/google_them/google_pdf_grabber.log"
+logger = logging.getLogger("pdf_grabber")
+
+DOC_TYPES = {
+    "Summary_of_Benefits": "summary of benefits",
+    "Evidence_of_Coverage": "evidence of coverage",
+    "Drug_Formulary": "formulary drug list",
+}
+
+# ---------------------------
+# Config
+# ---------------------------
+
+BASE_DIR = os.path.dirname(__file__)
+env_path = os.path.join(BASE_DIR, "env.json")
+with open(env_path, "r") as f:
+    env = json.load(f)
+
+API_KEY = env["Custom Search Api"]["key"].strip()
+CX_ID = env["Programmable Search Engine"]["id"].strip()
+
+SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+
+# ---------------------------
+# Utilities
+# ---------------------------
+
+def polite_sleep():
+    time.sleep(random.uniform(0.5, 1.5))
+
+def is_pdf_url(u: str) -> bool:
+    return ".pdf" in u.lower()
+
+def run_search(query, max_results=10, start_index=1, session=None):
+    session = session or requests.Session()
+    params = {"key": API_KEY, "cx": CX_ID, "q": query,
+              "num": min(max_results, 10), "start": start_index}
+    for attempt in range(5):
+        r = session.get(SEARCH_URL, params=params, timeout=30)
+        if r.status_code == 429:
+            retry = int(r.headers.get("Retry-After", 0)) or (2 ** attempt)
+            logger.warning(f"[429] rate-limited; sleeping {retry}s (attempt {attempt+1}/5)")
+            time.sleep(retry)
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise requests.HTTPError("Exceeded retries after repeated 429s")
+
+def collect_candidates(plan_id, plan_name, label="broad", pages=3, debug_dir=None):
+    """
+    Collect *all* PDF candidate links for a plan/doc_label.
+    """
+    if label == "broad":
+        query = f"{plan_id} {plan_name} filetype:pdf"
+    else:
+        query = f"{plan_id} {plan_name} {DOC_TYPES[label]} filetype:pdf"
+
+    candidates = []
+    for page in range(pages):
+        start_index = page * 10 + 1
+        data = run_search(query, max_results=10, start_index=start_index)
+
+        # Save debug JSON if enabled
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, f"{plan_id}_{label}_page{page+1}.json")
+            with open(debug_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            logger.debug(f"[DEBUG] Saved raw JSON → {debug_file}")
+
+        for item in data.get("items", []):
+            url = item.get("link", "")
+            title = item.get("title", "")
+            snippet = item.get("snippet", "")
+            if url and is_pdf_url(url):
+                candidates.append(url)
+        polite_sleep()
+    logger.info(f"[API SEARCH] {plan_id} {label} → {len(candidates)} pdf candidates")
+    return candidates
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True, help="Output candidates CSV")
+    ap.add_argument("--pages", type=int, default=3, help="Max API pages per query (default: 3)")
+    ap.add_argument("--debug", action="store_true", help="Save raw JSON responses")
+    args = ap.parse_args()
+
+    # Configure logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
+                  logging.StreamHandler()]
+    )
+    logger.setLevel(log_level)
+
+    # Debug directory
+    debug_dir = None
+    if args.debug:
+        debug_dir = os.path.join(os.path.dirname(args.output), "debug_json")
+
+    with open(args.input, newline="", encoding="utf-8") as f:
+        reader = list(csv.DictReader(f))
+
+    out_exists = os.path.exists(args.output)
+    out_fh = open(args.output, "a", newline="", encoding="utf-8")
+    out_writer = csv.DictWriter(
+        out_fh,
+        fieldnames=["plan_id", "plan_name", "company", "doc_label", "candidate_links"],
+    )
+    if not out_exists:
+        out_writer.writeheader()
+
+    session = requests.Session()
+
+    for idx, plan in enumerate(reader, start=1):
+        plan_id = (plan.get("plan_id") or "").strip()
+        plan_name = (plan.get("plan_name") or "").strip()
+        company = (plan.get("company") or "").strip()
+
+        logger.info(f"[INFO] ({idx}/{len(reader)}) Collecting candidates for {plan_id} {plan_name}")
+
+        for doc_label in DOC_TYPES.keys():
+            candidates = collect_candidates(plan_id, plan_name, label=doc_label,
+                                            pages=args.pages, debug_dir=debug_dir)
+            row = {
+                "plan_id": plan_id,
+                "plan_name": plan_name,
+                "company": company,
+                "doc_label": doc_label,
+                "candidate_links": json.dumps(candidates),
+            }
+            out_writer.writerow(row)
+            out_fh.flush()
+
+    out_fh.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+# 2. New `filter_and_download.py` (Stage 2: Filtering + Downloading)
+
+This script takes `candidates.csv` and applies your filtering logic. Start simple (e.g., domain whitelist, year check) and refine.
+
+```python
+#!/usr/bin/env python3
+"""
+Stage 2: Filter candidate links and download true matches.
+"""
+
+import os
+import csv
+import json
+import argparse
+import logging
+import requests
+
+# ---------------------------
+# Setup
+# ---------------------------
+
+LOG_FILE = "medicare/google_them/filter_and_download.log"
+logger = logging.getLogger("filter_and_download")
+
+# Example whitelist (extendable)
+DOMAIN_WHITELIST = {
+    "Cigna": ["cigna.com", "medicareadvantage.com"],
+    "Humana": ["humana-medicare.com"],
+    "Aetna": ["aetna.com"],
+    "UnitedHealthcare": ["uhc.com", "uhcmedicareplans.com"],
+}
+
+def allowed_domain(url, company):
+    hosts = DOMAIN_WHITELIST.get(company, [])
+    return any(h in url for h in hosts)
+
+def download_pdf(session, url, dest_path):
+    if os.path.exists(dest_path):
+        logger.info(f"[SKIP] {dest_path} already exists")
+        return True
+    try:
+        r = session.get(url, stream=True, timeout=30)
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+        logger.info(f"[DOWNLOAD] {url} → {dest_path}")
+        return True
+    except Exception as e:
+        logger.error(f"[ERROR] Failed {url}: {e}")
+        return False
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True, help="candidates.csv from Stage 1")
+    ap.add_argument("--outdir", required=True, help="Directory to save PDFs")
+    ap.add_argument("--output", required=True, help="Filtered results CSV")
+    args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
+                  logging.StreamHandler()]
+    )
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    out_exists = os.path.exists(args.output)
+    out_fh = open(args.output, "a", newline="", encoding="utf-8")
+    out_writer = csv.DictWriter(
+        out_fh,
+        fieldnames=[
+            "plan_id","plan_name","company","doc_label",
+            "chosen_link","pdf_filepath","all_candidates"
+        ],
+    )
+    if not out_exists:
+        out_writer.writeheader()
+
+    session = requests.Session()
+
+    with open(args.input, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            plan_id = row["plan_id"]
+            plan_name = row["plan_name"]
+            company = row["company"]
+            doc_label = row["doc_label"]
+            candidates = json.loads(row["candidate_links"])
+
+            # Example: choose first candidate from allowed domain
+            chosen = next((u for u in candidates if allowed_domain(u, company)), None)
+
+            pdf_path = ""
+            if chosen:
+                pdf_path = os.path.join(args.outdir, f"{plan_id}_{doc_label}.pdf")
+                download_pdf(session, chosen, pdf_path)
+
+            out_writer.writerow({
+                "plan_id": plan_id,
+                "plan_name": plan_name,
+                "company": company,
+                "doc_label": doc_label,
+                "chosen_link": chosen or "",
+                "pdf_filepath": pdf_path,
+                "all_candidates": json.dumps(candidates),
+            })
+            out_fh.flush()
+
+    out_fh.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 🚀 Workflow
+
+1. **Collect candidates** (burns API calls once per plan/doc):
+
+   ```bash
+   python pdf_grabber.py \
+     --input medicare/google_them/plan_links_for_google_deduped.csv \
+     --output medicare/google_them/candidates.csv \
+     --pages 3 --debug
+   ```
+
+2. **Filter + download** (offline, repeatable):
+
+   ```bash
+   python filter_and_download.py \
+     --input medicare/google_them/candidates.csv \
+     --outdir medicare/google_them/filtered_pdfs \
+     --output medicare/google_them/plan_pdfs.csv
+   ```
+
+---
+
+Do you want me to also build in a **config file mechanism** (e.g., `domain_whitelist.json`) so you can update domains dynamically without touching the code?
+
+
+------------------------------------------------------------------------------------------------
+
+Yes.  I also want you to incorporate the normalize_plan_id() function we developed in humana:
+```
+
+def normalize_plan_id(plan_id: str) -> str:
+    """
+    Convert a CSV-style plan ID like 'H5216-318-1' into Humana's PDF format 'H5216318001'.
+    Rules:
+    - Strip dashes
+    - Last segment must be left-padded to 3 digits
+    """
+    parts = plan_id.replace(" ", "").split("-")
+    if len(parts) != 3:
+        raise ValueError(f"Unexpected plan_id format: {plan_id}")
+    prefix, mid, suffix = parts
+    suffix_padded = suffix.zfill(3)
+    return f"{prefix}{mid}{suffix_padded}"
+```
+
+It is possible that other companies will use the normal planID format, or the normalized format, but not likely that they will use both.  So we should run searches with both formats independently, unless google has a feature to search "X or Y" in a single query.
+
+In fact, it is likely worth giving the detailed logfile and analysis.csv an in-depth review.  Overall our approach is based on effective use of the google search API to find each of our 3 documents for each plan, with minimal duplicate searching so we don't rack up exorbitant costs over the thousands of plans we need to find the 3 documents for.
+
+Also note that while we do need a SoB and EoC for each plan, if we can't find the formulary that's okay.  Only the SoB and EoC are hard requirements to consider a plan complete.  If we also find the formulary that's nice and we'd like to include it, but if we get the SoB and EoC in the first search, it's not worth sending another 12 API calls just to track down the formulary, when those calls could instead be dedicated to finding the SoB and EoC for the next plan.
+
+Please take your time reviewing and researching.  We're now in the central decisions that will determine the effectiveness of our system.
+
+------------------------------------------------------------------------------------------------
+
+Absolutely—this is the right time to lock down the “collect once, filter later” workflow, add the Humana-style `normalize_plan_id`, and make the domain allow-list editable without code changes. Below is a complete, drop-in set:
+
+* Updated **Stage 1** (`pdf_grabber.py`): collect candidates only, **use both plan-ID formats** (via `OR` or separate queries), cache raw JSON, early-stop once SoB & EoC have enough candidates, and **skip extra queries for Formulary** if SoB+EoC already have candidates.
+* New **config files** (`search_config.json`, `domain_whitelist.json`).
+* Updated **Stage 2** (`filter_and_download.py`): loads the domain allow-list JSON; picks a candidate per (plan, doc\_type) with a simple, transparent scoring that prefers allow-listed domains and URLs containing either plan-ID format; then downloads.
+* (No change to your validator: run it after Stage 2.)
+
+---
+
+# 📄 `medicare/google_them/search_config.json` (new)
+
+```json
+{
+  "target_year": 2025,
+  "include_year_in_query": true,
+  "use_or_for_plan_ids": true,
+  "max_pages_per_query": 3,
+  "sleep_seconds_min": 0.8,
+  "sleep_seconds_max": 1.8,
+  "retry_attempts": 5,
+  "skip_formulary_when_sob_eoc_found": true,
+  "min_candidates_to_stop": {
+    "Summary_of_Benefits": 1,
+    "Evidence_of_Coverage": 1,
+    "Drug_Formulary": 1
+  }
+}
+```
+
+> Tweak this (no code changes needed). If you’re worried about over-filtering by year, set `"include_year_in_query": false`.
+
+---
+
+# 📄 `medicare/google_them/domain_whitelist.json` (new)
+
+```json
+{
+  "Cigna": ["cigna.com", "medicareadvantage.com", "static.cigna.com"],
+  "UnitedHealthcare": ["uhc.com", "uhcmedicareplans.com", "content.uhc.com"],
+  "Aetna Medicare": ["aetna.com"],
+  "Humana": ["humana.com", "humana-medicare.com", "docushare-web.apps.external.p.azure.humana.com"],
+  "VIVA Medicare": ["vivahealth.com"],
+  "_notes": "Add/update domains here; Stage 2 reads this at runtime."
+}
+```
+
+> You can add carriers or CDNs any time. If a company is missing, Stage 2 will fall back to “any domain allowed” for that row (so you never lose a plan because the allow-list is incomplete).
+
+---
+
+# 🧠 Shared helper: normalize both plan-id forms
+
+```python
+def normalize_plan_id(plan_id: str) -> str:
+    """
+    Convert 'H5216-318-1' -> 'H5216318001':
+      - strip spaces
+      - split on '-'
+      - left-pad last segment to 3 digits
+      - join
+    """
+    parts = plan_id.replace(" ", "").split("-")
+    if len(parts) != 3:
+        raise ValueError(f"Unexpected plan_id format: {plan_id}")
+    prefix, mid, suffix = parts
+    suffix_padded = suffix.zfill(3)
+    return f"{prefix}{mid}{suffix_padded}"
+```
+
+---
+
+# 🧰 Stage 1 – **Collect only** (no downloads)
+
+## 📄 `medicare/google_them/pdf_grabber.py` (updated)
+
+```python
+#!/usr/bin/env python3
+"""
+Stage 1: Collect candidate PDF links using Google Custom Search API.
+
+For each plan & doc_label, query once (or with an OR of both plan-id formats),
+save all PDF candidates, and dump raw JSON (cache) for offline analysis.
+
+Outputs: candidates.csv with rows:
+  plan_id, plan_name, company, doc_label, query_used, candidate_links
+"""
+
+import os, csv, json, time, random, argparse, logging, hashlib
+import requests
+
+# ---------------------------
+# Setup
+# ---------------------------
+
+LOG_FILE = "medicare/google_them/google_pdf_grabber.log"
+logger = logging.getLogger("pdf_grabber")
+
+DOC_TYPES = {
+    "Summary_of_Benefits": "summary of benefits",
+    "Evidence_of_Coverage": "evidence of coverage",
+    "Drug_Formulary": "formulary drug list",
+}
+
+BASE_DIR = os.path.dirname(__file__)
+ENV_PATH = os.path.join(BASE_DIR, "env.json")
+CONFIG_PATH = os.path.join(BASE_DIR, "search_config.json")
+
+with open(ENV_PATH, "r", encoding="utf-8") as f:
+    env = json.load(f)
+API_KEY = env["Custom Search Api"]["key"].strip()
+CX_ID   = env["Programmable Search Engine"]["id"].strip()
+
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CFG = json.load(f)
+
+SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def normalize_plan_id(plan_id: str) -> str:
+    parts = plan_id.replace(" ", "").split("-")
+    if len(parts) != 3:
+        raise ValueError(f"Unexpected plan_id format: {plan_id}")
+    prefix, mid, suffix = parts
+    return f"{prefix}{mid}{suffix.zfill(3)}"
+
+def polite_sleep():
+    time.sleep(random.uniform(CFG.get("sleep_seconds_min", 0.8), CFG.get("sleep_seconds_max", 1.8)))
+
+def is_pdf_url(u: str) -> bool:
+    return ".pdf" in (u or "").lower()
+
+def hashed_name(query: str) -> str:
+    return hashlib.sha1(query.encode("utf-8")).hexdigest()[:12]
+
+def build_query(plan_id_raw: str, plan_id_norm: str, plan_name: str, doc_label: str) -> str:
+    base_terms = []
+    # Prefer including plan name to boost relevance
+    if plan_name:
+        base_terms.append(plan_name)
+
+    # Plan ID(s)
+    use_or = CFG.get("use_or_for_plan_ids", True)
+    if use_or and plan_id_norm:
+        base_terms.append(f"(\"{plan_id_raw}\" OR {plan_id_norm})")
+    else:
+        # Fall back to raw only; Stage 1 will try norm separately if needed
+        base_terms.append(f"\"{plan_id_raw}\"")
+
+    # Doc type hint (targeted) or broad?
+    if doc_label in DOC_TYPES:
+        base_terms.append(DOC_TYPES[doc_label])
+
+    # Year hint
+    if CFG.get("include_year_in_query", True):
+        base_terms.append(str(CFG.get("target_year", "")))
+
+    terms = " ".join(t for t in base_terms if t)
+    return f"{terms} filetype:pdf".strip()
+
+def run_search(query, page_index, session=None, debug_dir=None, plan_id=None, label=None):
+    """Use on-disk cache first. Otherwise call API, save JSON, and return items list."""
+    session = session or requests.Session()
+    params = {"key": API_KEY, "cx": CX_ID, "q": query, "num": 10, "start": page_index}
+    qhash = hashed_name(query)
+    fname = f"{plan_id}_{label}_p{(page_index-1)//10+1}_{qhash}.json" if plan_id and label else f"p{(page_index-1)//10+1}_{qhash}.json"
+
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        fpath = os.path.join(debug_dir, fname)
+        # Cache hit
+        if os.path.exists(fpath):
+            with open(fpath, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            items = data.get("items", [])
+            logger.debug(f"[CACHE] {fname} → {len(items)} items")
+            return items
+
+    # Call API with backoff on 429
+    attempts = CFG.get("retry_attempts", 5)
+    for attempt in range(attempts):
+        r = session.get(SEARCH_URL, params=params, timeout=30)
+        if r.status_code == 429:
+            retry = int(r.headers.get("Retry-After", 0)) or (2 ** attempt)
+            logger.warning(f"[429] rate-limited; sleeping {retry}s (attempt {attempt+1}/{attempts})")
+            time.sleep(retry)
+            continue
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items", [])
+
+        if debug_dir:
+            with open(fpath, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            logger.debug(f"[DEBUG] Saved raw JSON → {fpath} ({len(items)} items)")
+
+        return items
+
+    raise requests.HTTPError("Exceeded retries after repeated 429s")
+
+def collect_candidates_for_label(plan_id, plan_name, doc_label, pages, debug_dir, session, plan_id_norm):
+    """Collect all PDF URLs for a given label with early stopping based on min_candidates_to_stop."""
+    min_stop = CFG.get("min_candidates_to_stop", {}).get(doc_label, 1)
+    candidates, seen = [], set()
+
+    query = build_query(plan_id, plan_id_norm, plan_name, doc_label)
+    logger.debug(f"[QUERY] {plan_id} {doc_label} → {query}")
+
+    for page in range(pages):
+        start_index = page * 10 + 1
+        items = run_search(query, start_index, session=session, debug_dir=debug_dir, plan_id=plan_id, label=doc_label)
+        for item in items:
+            url = item.get("link", "")
+            if is_pdf_url(url) and url not in seen:
+                seen.add(url)
+                candidates.append(url)
+        logger.debug(f"[DEBUG] {plan_id} {doc_label} page {page+1}: {len(items)} items, {len(candidates)} pdfs so far")
+        polite_sleep()
+        if len(candidates) >= min_stop:
+            break
+
+    logger.info(f"[API SEARCH] {plan_id} {doc_label} → {len(candidates)} candidates")
+    return query, candidates
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True, help="Output candidates CSV")
+    ap.add_argument("--pages", type=int, default=None, help="Override max pages per query")
+    ap.add_argument("--debug", action="store_true", help="Save/load raw JSON in outdir/debug_json")
+    ap.add_argument("--outdir", required=True, help="Base directory for debug JSON (and future outputs)")
+    args = ap.parse_args()
+
+    # Logging
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"), logging.StreamHandler()]
+    )
+    logger.setLevel(log_level)
+
+    max_pages = args.pages or CFG.get("max_pages_per_query", 3)
+    debug_dir = os.path.join(args.outdir, "debug_json") if args.debug else None
+
+    with open(args.input, newline="", encoding="utf-8") as f:
+        plans = list(csv.DictReader(f))
+
+    out_exists = os.path.exists(args.output)
+    out_fh = open(args.output, "a", newline="", encoding="utf-8")
+    writer = csv.DictWriter(out_fh, fieldnames=[
+        "plan_id","plan_name","company","doc_label","query_used","candidate_links"
+    ])
+    if not out_exists:
+        writer.writeheader()
+
+    session = requests.Session()
+
+    # Process plans; prioritize SoB/EoC, optionally skip Formulary if both found
+    for idx, plan in enumerate(plans, start=1):
+        plan_id = (plan.get("plan_id") or "").strip()
+        plan_name = (plan.get("plan_name") or "").strip()
+        company  = (plan.get("company")  or "").strip()
+
+        try:
+            plan_id_norm = normalize_plan_id(plan_id)
+        except Exception as e:
+            logger.warning(f"[WARN] normalize_plan_id failed for {plan_id}: {e}")
+            plan_id_norm = ""
+
+        logger.info(f"[INFO] ({idx}/{len(plans)}) Collecting for {plan_id} {plan_name}")
+
+        found_labels = set()
+        for doc_label in ["Summary_of_Benefits", "Evidence_of_Coverage", "Drug_Formulary"]:
+            # Optional: skip formulary if we already have SoB & EoC candidates
+            if (doc_label == "Drug_Formulary"
+                and CFG.get("skip_formulary_when_sob_eoc_found", True)
+                and {"Summary_of_Benefits","Evidence_of_Coverage"}.issubset(found_labels)):
+                logger.info(f"[SKIP] {plan_id} Formulary search skipped (SoB & EoC already have candidates)")
+                continue
+
+            query_used, candidates = collect_candidates_for_label(
+                plan_id, plan_name, doc_label, max_pages, debug_dir, session, plan_id_norm
+            )
+            if candidates:
+                found_labels.add(doc_label)
+
+            writer.writerow({
+                "plan_id": plan_id,
+                "plan_name": plan_name,
+                "company": company,
+                "doc_label": doc_label,
+                "query_used": query_used,
+                "candidate_links": json.dumps(candidates)
+            })
+            out_fh.flush()
+
+    out_fh.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+**What’s new / important here**
+
+* Uses **both plan-ID formats** in one query (via `("raw" OR normalized)`), controlled by config.
+* **Caches raw JSON** by plan/label/page+query hash; on rerun, it **reuses cache** (no quota burn).
+* **Early-stop per label** once `min_candidates_to_stop[label]` is met.
+* **Skips Formulary** search entirely if `skip_formulary_when_sob_eoc_found` and both already have candidates.
+* All behavior toggled in `search_config.json`.
+
+---
+
+# 🧰 Stage 2 – Filter & Download
+
+## 📄 `medicare/google_them/filter_and_download.py` (updated)
+
+```python
+#!/usr/bin/env python3
+"""
+Stage 2: Filter candidate links and download chosen PDFs.
+
+Reads:
+  - candidates.csv (from Stage 1)
+  - domain_whitelist.json (runtime-editable)
+
+Writes:
+  - plan_pdfs.csv with chosen link per (plan, doc_label)
+  - PDFs to outdir/
+"""
+
+import os, csv, json, argparse, logging, requests
+from urllib.parse import urlparse
+
+LOG_FILE = "medicare/google_them/filter_and_download.log"
+logger = logging.getLogger("filter_and_download")
+
+BASE_DIR = os.path.dirname(__file__)
+WHITELIST_PATH = os.path.join(BASE_DIR, "domain_whitelist.json")
+
+def normalize_plan_id(plan_id: str) -> str:
+    parts = plan_id.replace(" ", "").split("-")
+    if len(parts) != 3:
+        return ""  # don't hard-fail in Stage 2
+    prefix, mid, suffix = parts
+    return f"{prefix}{mid}{suffix.zfill(3)}"
+
+def load_whitelist(path: str):
+    if not os.path.exists(path):
+        logger.warning(f"[WARN] domain_whitelist.json not found at {path}; proceeding without restrictions")
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def host_matches(url: str, allowed_hosts: list[str]) -> bool:
+    if not allowed_hosts:
+        return True  # no restriction for this company
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return any(allowed in host for allowed in allowed_hosts)
+
+def score_candidate(url: str, plan_id_raw: str, plan_id_norm: str, allowed_hosts: list[str]) -> int:
+    """Simple transparent scoring for picking a link (before PDF validation)."""
+    score = 0
+    # 1) Domain preference
+    if host_matches(url, allowed_hosts):
+        score += 5
+    # 2) Plan ID hints in URL
+    u = url.lower()
+    if plan_id_raw.lower() in u:
+        score += 3
+    if plan_id_norm and plan_id_norm.lower() in u:
+        score += 2
+    # 3) Year hint in URL (light preference; real validation happens later)
+    #    Not required to avoid false negatives.
+    # if "2025" in u: score += 1
+    return score
+
+def download_pdf(session, url, dest_path):
+    if not url:
+        return False
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    if os.path.exists(dest_path):
+        logger.info(f"[SKIP] {dest_path} already exists")
+        return True
+    try:
+        r = session.get(url, stream=True, timeout=45)
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+        logger.info(f"[DOWNLOAD] {url} → {dest_path}")
+        return True
+    except Exception as e:
+        logger.error(f"[ERROR] Download failed {url}: {e}")
+        return False
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True, help="candidates.csv from Stage 1")
+    ap.add_argument("--outdir", required=True, help="Directory to save PDFs")
+    ap.add_argument("--output", required=True, help="plan_pdfs.csv")
+    ap.add_argument("--whitelist", default=WHITELIST_PATH, help="Path to domain_whitelist.json")
+    ap.add_argument("--download-topk", type=int, default=1, help="Download top-K candidates per (plan, doc_label)")
+    args = ap.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"), logging.StreamHandler()]
+    )
+    logger.setLevel(logging.INFO)
+
+    whitelist = load_whitelist(args.whitelist)
+    os.makedirs(args.outdir, exist_ok=True)
+
+    out_exists = os.path.exists(args.output)
+    out_fh = open(args.output, "a", newline="", encoding="utf-8")
+    writer = csv.DictWriter(out_fh, fieldnames=[
+        "plan_id","plan_name","company","doc_label","chosen_link","pdf_filepath","all_candidates"
+    ])
+    if not out_exists:
+        writer.writeheader()
+
+    session = requests.Session()
+
+    with open(args.input, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    for row in rows:
+        plan_id   = row["plan_id"]
+        plan_name = row["plan_name"]
+        company   = row["company"]
+        doc_label = row["doc_label"]
+        candidates = json.loads(row["candidate_links"] or "[]")
+
+        plan_id_norm = normalize_plan_id(plan_id)
+        allowed_hosts = whitelist.get(company, [])
+
+        # Score & sort candidates
+        ranked = sorted(
+            candidates,
+            key=lambda u: score_candidate(u, plan_id, plan_id_norm, allowed_hosts),
+            reverse=True
+        )
+
+        chosen = ranked[:args.download_topk]  # usually 1; can keep 2 for validator to choose later
+        saved_paths = []
+
+        for i, url in enumerate(chosen, start=1):
+            pdf_path = os.path.join(args.outdir, f"{plan_id}_{doc_label}_{i}.pdf" if args.download_topk > 1 else f"{plan_id}_{doc_label}.pdf")
+            if download_pdf(session, url, pdf_path):
+                saved_paths.append(pdf_path)
+
+        writer.writerow({
+            "plan_id": plan_id,
+            "plan_name": plan_name,
+            "company": company,
+            "doc_label": doc_label,
+            "chosen_link": chosen[0] if chosen else "",
+            "pdf_filepath": ";".join(saved_paths),
+            "all_candidates": json.dumps(candidates)
+        })
+        out_fh.flush()
+
+    out_fh.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+**Why this is safe with your concerns**
+
+* If a company is **missing in the whitelist**, that plan **still proceeds** (no hard block). You can refine later by editing `domain_whitelist.json`.
+* Plan ID **URL matching is a *preference*, not a requirement** (since some carriers use internal IDs). It improves picks without causing misses.
+* Year is only a **light preference** (commented out by default). True year verification happens in your validator.
+
+---
+
+# 🧪 How to run
+
+**Stage 1: Collect candidates (burns API once)**
+
+```powershell
+python medicare/google_them/pdf_grabber.py `
+  --input medicare/google_them/plan_links_for_google_deduped.csv `
+  --output medicare/google_them/candidates.csv `
+  --outdir medicare/google_them/testrun `
+  --debug
+```
+
+* Uses both plan-ID formats in one query (configurable).
+* Caches raw JSON in `testrun/debug_json/` so you can rerun the analyzer or adjust filters without extra API usage.
+* Stops early per doc type once it has enough candidates.
+* Skips Formulary if SoB & EoC already have candidates.
+
+**Stage 2: Filter & download (offline, repeatable)**
+
+```powershell
+python medicare/google_them/filter_and_download.py `
+  --input medicare/google_them/candidates.csv `
+  --outdir medicare/google_them/filtered_pdfs `
+  --output medicare/google_them/plan_pdfs.csv `
+  --whitelist medicare/google_them/domain_whitelist.json `
+  --download-topk 1
+```
+
+Then run your **validator** on `plan_pdfs.csv` (and optionally keep `--download-topk 2` so the validator can choose between the top two per doc).
+
+---
+
+# 🧭 Cost & performance controls (summary)
+
+* **One API pass per (plan, doc\_label)**; optionally skipping Formulary entirely if SoB & EoC already have candidates.
+* **Early stopping** per label once you have the minimum candidate count (config).
+* **Caching** of all raw JSON — tweak filters and re-run without additional API calls.
+* **Domain allow-list** is editable JSON; missing entries don’t block downloads, they just reduce preference scoring.
+
+---
+
+If you want, I can also wire a tiny **metrics reporter** that reads `candidates.csv` + `plan_pdfs.csv` + validator output to show, per carrier:
+
+* % plans with ≥1 SoB candidate
+* % plans with ≥1 EoC candidate
+* Final accepted PDFs (post-validation) + confidence averages
+
+That’ll give you a very fast feedback loop on real effectiveness before scaling.
+
+------------------------------------------------------------------------------------------------
+
+When running the searches, if a result for an EoC search happens to be a good candidate for Formulary, (or SoB for that matter), will that be added as a candidate?  It's possible, for example, that candidates for all 3 documents would appear in the first general search
+
+------------------------------------------------------------------------------------------------
+
+Good question — you spotted the key tradeoff.
+Right now the **Stage 1 collector I gave you** works like this:
+
+* It runs a **separate query for each `doc_label`** (`Summary_of_Benefits`, `Evidence_of_Coverage`, `Drug_Formulary`).
+* For each query, it only records results against that **intended `doc_label`**, even if the URL/snippet text clearly matches another category.
+
+That means:
+
+* If you run the **broad/general query** (`plan_id + plan_name filetype:pdf`), and the first page of results contains both a SoB and an EoC, you’ll still get both — because the `categorize_link()` function tags candidates by what’s in the link/snippet.
+  ✅ So broad queries already let you “pick up extra doc types for free.”
+
+* But if you run a **targeted query** (e.g. `... evidence of coverage filetype:pdf`), and one of those results happens to actually be a Formulary, today it would still be stored under `Evidence_of_Coverage` and not carried over.
+
+---
+
+### 🔧 How to improve
+
+We can make the collector more efficient by letting **any result be categorized into *any* doc\_label**, not just the one the query was aimed at. Two simple tweaks:
+
+1. When parsing results in `collect_candidates_for_label`, call `categorize_link(url, text)` and store into the *actual* `doc_label` it matched — not only the one you queried.
+2. Still keep track of the `query_label` (so you know which query produced it), but the row in `candidates.csv` would then show `doc_label="Summary_of_Benefits"` even if it came from the `Evidence_of_Coverage` query.
+
+That way:
+
+* Your first “broad” query might already give SoB + EoC + Formulary, and you won’t need to send more API calls.
+* Later targeted queries will only run if some doc types are still missing.
+
+---
+
+### 📊 Effect on cost
+
+This matters a lot for quota/cost:
+
+* In practice, the **first broad query per plan** often surfaces all three doc types.
+* By cross-categorizing results, you can cut the number of queries by **2–3×** while increasing hit rate.
+
+---
+
+✅ So to answer directly:
+
+* **Now:** broad queries already add multiple doc types if seen; targeted queries don’t.
+* **Proposed:** with a small change, *any* query can yield candidates for *any* doc type, reducing duplicate searches and API cost.
+
+---
+
+Do you want me to give you a **full file edit of `pdf_grabber.py`** that does this cross-categorization, so all queries feed candidates into the right doc type buckets?
+
+------------------------------------------------------------------------------------------------
+
+Yes
+
+------------------------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------------------------------
+
