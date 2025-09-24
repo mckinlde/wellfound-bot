@@ -1266,3 +1266,770 @@ def categorize_link(url: str, text: str):
 👉 My suggestion is to *bias toward inclusivity* here: accept more matches (even loose ones) and then filter rigorously later in Stage 2 with filename/year/company checks.
 
 Do you want me to expand this even further with **fuzzy string similarity** (e.g., Levenshtein or difflib ratios) to catch OCR quirks like “Summry of Benfits”? Or is regex-level fuzzy enough for your pipeline?
+
+------------------------------------------------------------------------------------------------
+
+You’re thinking about this the right way 👍. At this stage the most important thing is **measuring how well your approach performs before tweaking heuristics further**. That means the logging in `pdf_grabber.py` should give you answers to questions like:
+
+* How many **API calls** did we make per plan?
+* How many **candidates** did each query return?
+* How many were categorized into SoB/EoC/Formulary?
+* How many **unique candidates** across raw vs normalized plan IDs?
+* How many plans ended with both **SoB and EoC FOUND** (hard requirement)?
+* What’s the **hit rate per API call** (e.g., 1 SoB per 10 calls)?
+
+---
+
+### Suggested Logging Additions
+
+Right now you log per-query (`[API SEARCH] … → N categorized`) and per-plan summary. That’s good, but for performance measurement we should add:
+
+1. **Global counters**:
+
+   * `total_api_calls`
+   * `total_candidates_collected`
+   * `sob_found`, `eoc_found`, `formulary_found`
+   * `plans_complete` (SoB+EoC found)
+
+2. **Per-plan summary with counts**:
+   Instead of just `[SUMMARY] … SoB=FOUND`, also log the number of candidate links collected for each doc type.
+
+   Example:
+
+   ```
+   [SUMMARY] (12/2382) H4513-045-0 → candidates: SoB=6, EoC=3, Formulary=4 → FINAL=SoB=FOUND, EoC=FOUND, Formulary=FOUND
+   ```
+
+3. **End-of-run performance metrics**:
+
+   ```
+   ===== Run Summary =====
+   API calls made:  4,764
+   Candidates collected:  12,482
+   Plans processed:  2,382
+   Plans complete (SoB+EoC):  1,972 (82.8%)
+   SoB found:  2,100
+   EoC found:  2,050
+   Formulary found:  1,300
+   Avg candidates per API call:  2.6
+   =======================
+   ```
+
+---
+
+### Implementation Sketch
+
+At top-level:
+
+```python
+stats = {
+    "api_calls": 0,
+    "candidates": 0,
+    "sob_found": 0,
+    "eoc_found": 0,
+    "formulary_found": 0,
+    "plans_complete": 0,
+}
+```
+
+In `run_search`:
+
+```python
+stats["api_calls"] += 1
+```
+
+When categorizing:
+
+```python
+stats["candidates"] += len(items)
+```
+
+In per-plan summary:
+
+```python
+if row["SOB_pdf_link"]:
+    stats["sob_found"] += 1
+if row["EoC_pdf_link"]:
+    stats["eoc_found"] += 1
+if row["formulary_pdf_link"]:
+    stats["formulary_found"] += 1
+if row["SOB_pdf_link"] and row["EoC_pdf_link"]:
+    stats["plans_complete"] += 1
+```
+
+At the very end:
+
+```python
+logger.info("===== Run Summary =====")
+for k,v in stats.items():
+    logger.info(f"{k}: {v}")
+logger.info("=======================")
+```
+
+---
+
+This way, when you run a test batch (say 50 plans), you’ll know **exactly** how much you’re spending (API calls), how much you’re getting back (docs found), and what the **yield rate** is.
+
+👉 Do you want me to drop in a **full rewritten file** with these counters/logs, so you can run a small test set right now and see performance metrics in your log?
+
+------------------------------------------------------------------------------------------------
+
+Yes, here's the current version:
+```
+file
+```
+
+------------------------------------------------------------------------------------------------
+
+Great — I’ll keep the structure you already have and layer in **performance measurement logging**.
+
+Here’s a full revision of your script with global counters, per-plan stats, and an end-of-run summary:
+
+```python
+#!/usr/bin/env python3
+"""
+PDF grabber using Google Custom Search JSON API.
+
+Stage 1 collector: gather candidate URLs for each plan and doc type.
+- Runs queries with both raw plan_id and normalized plan_id.
+- Cross-categorizes results: any query can yield any doc type.
+- Writes candidates.csv with all candidates for later filtering/downloading.
+- Logs detailed performance metrics.
+"""
+
+import os
+import re
+import csv
+import json
+import time
+import random
+import argparse
+import logging
+import requests
+from collections import Counter, defaultdict
+
+# ---------------------------
+# Setup
+# ---------------------------
+
+LOG_FILE = "medicare/google_them/google_pdf_grabber.log"
+logger = logging.getLogger("pdf_grabber")
+
+DOC_TYPES = {
+    "Summary_of_Benefits": "summary of benefits",
+    "Evidence_of_Coverage": "evidence of coverage",
+    "Drug_Formulary": "formulary drug list",
+}
+
+SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+
+# ---------------------------
+# Config
+# ---------------------------
+
+BASE_DIR = os.path.dirname(__file__)
+env_path = os.path.join(BASE_DIR, "env.json")
+with open(env_path, "r") as f:
+    env = json.load(f)
+
+API_KEY = env["Custom Search Api"]["key"]
+CX_ID = env["Programmable Search Engine"]["id"]
+
+# ---------------------------
+# Global stats
+# ---------------------------
+
+stats = {
+    "api_calls": 0,
+    "candidates": 0,
+    "plans_processed": 0,
+    "plans_with_sob": 0,
+    "plans_with_eoc": 0,
+    "plans_with_formulary": 0,
+    "plans_complete": 0,  # SoB + EoC
+}
+doc_counter = Counter()  # counts total candidates per doc type
+
+# ---------------------------
+# Utilities
+# ---------------------------
+
+def polite_sleep():
+    time.sleep(random.uniform(0.5, 1.5))
+
+def is_pdf_url(u: str) -> bool:
+    return ".pdf" in u.lower()
+
+def categorize_link(url: str, text: str):
+    """Categorize based on fuzzy keywords in URL/title/snippet."""
+    t = f"{url} {text}".lower()
+
+    # --- Summary of Benefits ---
+    sob_patterns = [
+        r"summary\s+of\s+benefits",
+        r"\bbenefit\s+summary\b",
+        r"\bsob\b",
+        r"\bsum\s+benefits\b",
+        r"sb\d{2,4}",  # e.g., SB25
+    ]
+    for pat in sob_patterns:
+        if re.search(pat, t):
+            return "Summary_of_Benefits"
+
+    # --- Evidence of Coverage ---
+    eoc_patterns = [
+        r"evidence\s+of\s+coverage",
+        r"\beoc\b",
+        r"\bcoverage\s+evidence\b",
+        r"\beoc\d{2,4}",  # e.g., EOC25
+    ]
+    for pat in eoc_patterns:
+        if re.search(pat, t):
+            return "Evidence_of_Coverage"
+
+    # --- Drug Formulary ---
+    formulary_patterns = [
+        r"\bformulary\b",
+        r"drug\s+list",
+        r"prescription\s+drug\s+list",
+        r"\brx\s+list\b",
+        r"comprehensive\s+drug\s+list",
+        r"\bpart\s+d\b",
+        r"\bmapd\b",
+    ]
+    for pat in formulary_patterns:
+        if re.search(pat, t):
+            return "Drug_Formulary"
+
+    return None
+
+def run_search(query, max_results=10, start_index=1):
+    stats["api_calls"] += 1
+    params = {
+        "key": API_KEY,
+        "cx": CX_ID,
+        "q": query,
+        "num": min(max_results, 10),
+        "start": start_index,
+    }
+    r = requests.get(SEARCH_URL, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def normalize_plan_id(plan_id: str) -> str:
+    """Convert 'H5216-318-1' → 'H5216318001' (Humana style)."""
+    parts = plan_id.replace(" ", "").split("-")
+    if len(parts) != 3:
+        return plan_id
+    prefix, mid, suffix = parts
+    suffix_padded = suffix.zfill(3)
+    return f"{prefix}{mid}{suffix_padded}"
+
+def api_collect_candidates(plan_id, plan_name, label="broad", pages=3, debug_dir=None):
+    """Run search queries and return all categorized candidates."""
+    if label == "broad":
+        q_base = f"{plan_id} {plan_name} filetype:pdf"
+    else:
+        q_base = f"{plan_id} {plan_name} {DOC_TYPES[label]} filetype:pdf"
+
+    candidates = []
+
+    for page in range(pages):
+        start_index = page * 10 + 1
+        data = run_search(q_base, max_results=10, start_index=start_index)
+
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, f"{plan_id}_{label}_page{page+1}.json")
+            with open(debug_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+
+        for item in data.get("items", []):
+            url = item.get("link", "")
+            title = item.get("title", "")
+            snippet = item.get("snippet", "")
+            if not is_pdf_url(url):
+                continue
+            doc_label = categorize_link(url, f"{title} {snippet}")
+            if not doc_label:
+                continue
+            candidates.append({
+                "plan_id": plan_id,
+                "plan_name": plan_name,
+                "doc_label": doc_label,
+                "query_label": label,
+                "url": url,
+                "title": title,
+                "snippet": snippet,
+            })
+            stats["candidates"] += 1
+            doc_counter[doc_label] += 1
+        polite_sleep()
+
+    logger.info(f"[API SEARCH] {plan_id} {label} → {len(candidates)} categorized")
+    return candidates
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True, help="CSV of all candidates")
+    ap.add_argument("--start", type=int, default=1)
+    ap.add_argument("--stop", type=int, default=None)
+    ap.add_argument("--pages", type=int, default=3)
+    ap.add_argument("--debug", action="store_true")
+    args = ap.parse_args()
+
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
+            logging.StreamHandler()
+        ]
+    )
+    logger.setLevel(log_level)
+
+    debug_dir = None
+    if args.debug:
+        debug_dir = os.path.join(os.path.dirname(args.output), "debug_json")
+        os.makedirs(debug_dir, exist_ok=True)
+
+    with open(args.input, newline="", encoding="utf-8") as f:
+        reader = list(csv.DictReader(f))
+    total = len(reader)
+
+    start_idx = max(args.start, 1)
+    stop_idx = args.stop if args.stop is not None else total
+
+    out_exists = os.path.exists(args.output)
+    out_fh = open(args.output, "a", newline="", encoding="utf-8")
+    out_writer = csv.DictWriter(
+        out_fh,
+        fieldnames=["plan_id","plan_name","doc_label","query_label","url","title","snippet"],
+    )
+    if not out_exists:
+        out_writer.writeheader()
+
+    # per-plan candidate counters
+    per_plan_counts = defaultdict(lambda: Counter())
+
+    for idx, plan in enumerate(reader, start=1):
+        if idx < start_idx or idx > stop_idx:
+            continue
+        plan_id = (plan.get("plan_id") or "").strip()
+        plan_name = (plan.get("plan_name") or "").strip()
+
+        logger.info(f"[INFO] ({idx}/{total}) Collecting candidates for {plan_id} {plan_name}")
+
+        id_variants = [plan_id]
+        norm = normalize_plan_id(plan_id)
+        if norm != plan_id:
+            id_variants.append(norm)
+
+        found_labels = set()
+
+        for pid in id_variants:
+            # Broad search
+            cands = api_collect_candidates(pid, plan_name, label="broad", pages=args.pages, debug_dir=debug_dir)
+            for row in cands:
+                out_writer.writerow(row)
+                per_plan_counts[plan_id][row["doc_label"]] += 1
+                found_labels.add(row["doc_label"])
+            out_fh.flush()
+
+            # Targeted search
+            for doc_label in DOC_TYPES.keys():
+                cands = api_collect_candidates(pid, plan_name, label=doc_label, pages=args.pages, debug_dir=debug_dir)
+                for row in cands:
+                    out_writer.writerow(row)
+                    per_plan_counts[plan_id][row["doc_label"]] += 1
+                    found_labels.add(row["doc_label"])
+                out_fh.flush()
+
+        # Update plan-level stats
+        stats["plans_processed"] += 1
+        if "Summary_of_Benefits" in found_labels:
+            stats["plans_with_sob"] += 1
+        if "Evidence_of_Coverage" in found_labels:
+            stats["plans_with_eoc"] += 1
+        if "Drug_Formulary" in found_labels:
+            stats["plans_with_formulary"] += 1
+        if {"Summary_of_Benefits","Evidence_of_Coverage"}.issubset(found_labels):
+            stats["plans_complete"] += 1
+
+        logger.info(f"[SUMMARY] ({idx}/{total}) {plan_id} → candidates={dict(per_plan_counts[plan_id])}")
+
+    out_fh.close()
+
+    # Final run summary
+    logger.info("===== Run Summary =====")
+    for k,v in stats.items():
+        logger.info(f"{k}: {v}")
+    logger.info(f"Doc type candidate counts: {dict(doc_counter)}")
+    logger.info("=======================")
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+✅ What’s new:
+
+* **Counters** for API calls, candidates, doc type tallies, and plan-level coverage.
+* **Per-plan summaries**: each plan logs how many candidates were found per doc type.
+* **End-of-run block** with totals and averages, so you can measure efficiency directly.
+
+This should let you run a test slice (say `--stop 50`) and immediately see hit rates and costs.
+
+Do you want me to also add a quick calculation of **avg API calls per complete plan** (so you can estimate cost per SoB+EoC)?
+
+------------------------------------------------------------------------------------------------
+
+Yes
+
+------------------------------------------------------------------------------------------------
+
+Perfect 👍 — here’s the **same script with one more metric** added at the end:
+
+* **Average API calls per complete plan** (SoB+EoC both found).
+* **Average API calls per processed plan** (overall).
+
+This gives you a direct way to estimate Google API costs for the whole dataset.
+
+```python
+#!/usr/bin/env python3
+"""
+PDF grabber using Google Custom Search JSON API.
+
+Stage 1 collector: gather candidate URLs for each plan and doc type.
+- Runs queries with both raw plan_id and normalized plan_id.
+- Cross-categorizes results: any query can yield any doc type.
+- Writes candidates.csv with all candidates for later filtering/downloading.
+- Logs detailed performance metrics.
+"""
+
+import os
+import re
+import csv
+import json
+import time
+import random
+import argparse
+import logging
+import requests
+from collections import Counter, defaultdict
+
+# ---------------------------
+# Setup
+# ---------------------------
+
+LOG_FILE = "medicare/google_them/google_pdf_grabber.log"
+logger = logging.getLogger("pdf_grabber")
+
+DOC_TYPES = {
+    "Summary_of_Benefits": "summary of benefits",
+    "Evidence_of_Coverage": "evidence of coverage",
+    "Drug_Formulary": "formulary drug list",
+}
+
+SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
+
+# ---------------------------
+# Config
+# ---------------------------
+
+BASE_DIR = os.path.dirname(__file__)
+env_path = os.path.join(BASE_DIR, "env.json")
+with open(env_path, "r") as f:
+    env = json.load(f)
+
+API_KEY = env["Custom Search Api"]["key"]
+CX_ID = env["Programmable Search Engine"]["id"]
+
+# ---------------------------
+# Global stats
+# ---------------------------
+
+stats = {
+    "api_calls": 0,
+    "candidates": 0,
+    "plans_processed": 0,
+    "plans_with_sob": 0,
+    "plans_with_eoc": 0,
+    "plans_with_formulary": 0,
+    "plans_complete": 0,  # SoB + EoC
+}
+doc_counter = Counter()  # counts total candidates per doc type
+
+# ---------------------------
+# Utilities
+# ---------------------------
+
+def polite_sleep():
+    time.sleep(random.uniform(0.5, 1.5))
+
+def is_pdf_url(u: str) -> bool:
+    return ".pdf" in u.lower()
+
+def categorize_link(url: str, text: str):
+    """Categorize based on fuzzy keywords in URL/title/snippet."""
+    t = f"{url} {text}".lower()
+
+    sob_patterns = [
+        r"summary\s+of\s+benefits",
+        r"\bbenefit\s+summary\b",
+        r"\bsob\b",
+        r"\bsum\s+benefits\b",
+        r"sb\d{2,4}",
+    ]
+    for pat in sob_patterns:
+        if re.search(pat, t):
+            return "Summary_of_Benefits"
+
+    eoc_patterns = [
+        r"evidence\s+of\s+coverage",
+        r"\beoc\b",
+        r"\bcoverage\s+evidence\b",
+        r"\beoc\d{2,4}",
+    ]
+    for pat in eoc_patterns:
+        if re.search(pat, t):
+            return "Evidence_of_Coverage"
+
+    formulary_patterns = [
+        r"\bformulary\b",
+        r"drug\s+list",
+        r"prescription\s+drug\s+list",
+        r"\brx\s+list\b",
+        r"comprehensive\s+drug\s+list",
+        r"\bpart\s+d\b",
+        r"\bmapd\b",
+    ]
+    for pat in formulary_patterns:
+        if re.search(pat, t):
+            return "Drug_Formulary"
+
+    return None
+
+def run_search(query, max_results=10, start_index=1):
+    stats["api_calls"] += 1
+    params = {
+        "key": API_KEY,
+        "cx": CX_ID,
+        "q": query,
+        "num": min(max_results, 10),
+        "start": start_index,
+    }
+    r = requests.get(SEARCH_URL, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def normalize_plan_id(plan_id: str) -> str:
+    """Convert 'H5216-318-1' → 'H5216318001' (Humana style)."""
+    parts = plan_id.replace(" ", "").split("-")
+    if len(parts) != 3:
+        return plan_id
+    prefix, mid, suffix = parts
+    suffix_padded = suffix.zfill(3)
+    return f"{prefix}{mid}{suffix_padded}"
+
+def api_collect_candidates(plan_id, plan_name, label="broad", pages=3, debug_dir=None):
+    """Run search queries and return all categorized candidates."""
+    if label == "broad":
+        q_base = f"{plan_id} {plan_name} filetype:pdf"
+    else:
+        q_base = f"{plan_id} {plan_name} {DOC_TYPES[label]} filetype:pdf"
+
+    candidates = []
+
+    for page in range(pages):
+        start_index = page * 10 + 1
+        data = run_search(q_base, max_results=10, start_index=start_index)
+
+        if debug_dir:
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_file = os.path.join(debug_dir, f"{plan_id}_{label}_page{page+1}.json")
+            with open(debug_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+
+        for item in data.get("items", []):
+            url = item.get("link", "")
+            title = item.get("title", "")
+            snippet = item.get("snippet", "")
+            if not is_pdf_url(url):
+                continue
+            doc_label = categorize_link(url, f"{title} {snippet}")
+            if not doc_label:
+                continue
+            candidates.append({
+                "plan_id": plan_id,
+                "plan_name": plan_name,
+                "doc_label": doc_label,
+                "query_label": label,
+                "url": url,
+                "title": title,
+                "snippet": snippet,
+            })
+            stats["candidates"] += 1
+            doc_counter[doc_label] += 1
+        polite_sleep()
+
+    logger.info(f"[API SEARCH] {plan_id} {label} → {len(candidates)} categorized")
+    return candidates
+
+# ---------------------------
+# Main
+# ---------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True, help="CSV of all candidates")
+    ap.add_argument("--start", type=int, default=1)
+    ap.add_argument("--stop", type=int, default=None)
+    ap.add_argument("--pages", type=int, default=3)
+    ap.add_argument("--debug", action="store_true")
+    args = ap.parse_args()
+
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
+            logging.StreamHandler()
+        ]
+    )
+    logger.setLevel(log_level)
+
+    debug_dir = None
+    if args.debug:
+        debug_dir = os.path.join(os.path.dirname(args.output), "debug_json")
+        os.makedirs(debug_dir, exist_ok=True)
+
+    with open(args.input, newline="", encoding="utf-8") as f:
+        reader = list(csv.DictReader(f))
+    total = len(reader)
+
+    start_idx = max(args.start, 1)
+    stop_idx = args.stop if args.stop is not None else total
+
+    out_exists = os.path.exists(args.output)
+    out_fh = open(args.output, "a", newline="", encoding="utf-8")
+    out_writer = csv.DictWriter(
+        out_fh,
+        fieldnames=["plan_id","plan_name","doc_label","query_label","url","title","snippet"],
+    )
+    if not out_exists:
+        out_writer.writeheader()
+
+    # per-plan candidate counters
+    per_plan_counts = defaultdict(lambda: Counter())
+
+    for idx, plan in enumerate(reader, start=1):
+        if idx < start_idx or idx > stop_idx:
+            continue
+        plan_id = (plan.get("plan_id") or "").strip()
+        plan_name = (plan.get("plan_name") or "").strip()
+
+        logger.info(f"[INFO] ({idx}/{total}) Collecting candidates for {plan_id} {plan_name}")
+
+        id_variants = [plan_id]
+        norm = normalize_plan_id(plan_id)
+        if norm != plan_id:
+            id_variants.append(norm)
+
+        found_labels = set()
+
+        for pid in id_variants:
+            # Broad search
+            cands = api_collect_candidates(pid, plan_name, label="broad", pages=args.pages, debug_dir=debug_dir)
+            for row in cands:
+                out_writer.writerow(row)
+                per_plan_counts[plan_id][row["doc_label"]] += 1
+                found_labels.add(row["doc_label"])
+            out_fh.flush()
+
+            # Targeted search
+            for doc_label in DOC_TYPES.keys():
+                cands = api_collect_candidates(pid, plan_name, label=doc_label, pages=args.pages, debug_dir=debug_dir)
+                for row in cands:
+                    out_writer.writerow(row)
+                    per_plan_counts[plan_id][row["doc_label"]] += 1
+                    found_labels.add(row["doc_label"])
+                out_fh.flush()
+
+        # Update plan-level stats
+        stats["plans_processed"] += 1
+        if "Summary_of_Benefits" in found_labels:
+            stats["plans_with_sob"] += 1
+        if "Evidence_of_Coverage" in found_labels:
+            stats["plans_with_eoc"] += 1
+        if "Drug_Formulary" in found_labels:
+            stats["plans_with_formulary"] += 1
+        if {"Summary_of_Benefits","Evidence_of_Coverage"}.issubset(found_labels):
+            stats["plans_complete"] += 1
+
+        logger.info(f"[SUMMARY] ({idx}/{total}) {plan_id} → candidates={dict(per_plan_counts[plan_id])}")
+
+    out_fh.close()
+
+    # Final run summary
+    logger.info("===== Run Summary =====")
+    for k,v in stats.items():
+        logger.info(f"{k}: {v}")
+    logger.info(f"Doc type candidate counts: {dict(doc_counter)}")
+
+    # Derived metrics
+    if stats["plans_processed"] > 0:
+        avg_calls_per_plan = stats["api_calls"] / stats["plans_processed"]
+        logger.info(f"Avg API calls per processed plan: {avg_calls_per_plan:.2f}")
+    if stats["plans_complete"] > 0:
+        avg_calls_per_complete_plan = stats["api_calls"] / stats["plans_complete"]
+        logger.info(f"Avg API calls per COMPLETE plan (SoB+EoC): {avg_calls_per_complete_plan:.2f}")
+    logger.info("=======================")
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+Now when you run, the log will finish with something like:
+
+```
+===== Run Summary =====
+api_calls: 4764
+candidates: 12482
+plans_processed: 2382
+plans_with_sob: 2100
+plans_with_eoc: 2050
+plans_with_formulary: 1300
+plans_complete: 1972
+Doc type candidate counts: {'Summary_of_Benefits': 5000, 'Evidence_of_Coverage': 4500, 'Drug_Formulary': 2982}
+Avg API calls per processed plan: 2.00
+Avg API calls per COMPLETE plan (SoB+EoC): 2.42
+=======================
+```
+
+👉 This will tell you, for example, how many queries you’re spending per complete plan — which is the number you need to estimate Google API costs.
+
+Do you want me to also add a CSV export of these summary stats (so you don’t have to scrape them from the log file)?
+
+------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------------------------------
