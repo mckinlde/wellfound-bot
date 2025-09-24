@@ -2024,7 +2024,46 @@ Do you want me to also add a CSV export of these summary stats (so you don’t h
 
 ------------------------------------------------------------------------------------------------
 
+Not yet; it seems I need an updated usage snippet:
+
+
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> python medicare/google_them/pdf_grabber.py `
+>>   --input medicare/google_them/plan_links_for_google_deduped.csv `
+>>   --output medicare/google_them/testrun/plan_pdfs.csv `
+>>   --outdir medicare/google_them/testrun `
+>>   --debug `
+>>   --start 1 `
+>>   --stop 10
+Could not find platform independent libraries <prefix>
+usage: pdf_grabber.py [-h] --input INPUT
+                      --output OUTPUT [--start START]
+                      [--stop STOP] [--pages PAGES]
+                      [--debug]
+pdf_grabber.py: error: unrecognized arguments: --outdir medicare/google_them/testrun
+
 ------------------------------------------------------------------------------------------------
+
+Got it ✅ — in the new collector-style `pdf_grabber.py` we wrote, there’s **no `--outdir` argument anymore** because it doesn’t download PDFs; it only collects and logs candidate URLs.
+
+So your usage should look like this instead:
+
+```powershell
+(.venv) PS C:\Users\mckin\OneDrive\Desktop\syncthing-folder\Git Repos\wellfound-bot> python medicare/google_them/pdf_grabber.py `
+  --input medicare/google_them/plan_links_for_google_deduped.csv `
+  --output medicare/google_them/testrun/candidates.csv `
+  --debug `
+  --start 1 `
+  --stop 10
+```
+
+Key changes:
+
+* Replace `--outdir ...` with just an `--output` CSV (e.g. `candidates.csv`).
+* The script will also make a `debug_json/` folder **next to your output file** if you pass `--debug`.
+
+👉 Later stages (e.g. `pdf_filter.py` or `pdf_downloader.py`) would read from `candidates.csv` and actually download PDFs into an `outdir`.
+
+Do you want me to stub out that **Stage 2 downloader** now, so you can run the full loop (collect → filter → download) with the same plan list?
 
 ------------------------------------------------------------------------------------------------
 

@@ -9,10 +9,10 @@ pdf_grabber.py
 ```
 python medicare/google_them/pdf_grabber.py `
   --input medicare/google_them/plan_links_for_google_deduped.csv `
-  --output medicare/google_them/testrun/plan_pdfs.csv `
-  --outdir medicare/google_them/testrun `
+  --output medicare/google_them/testrun/candidates.csv `
   --debug `
-  --start 1
+  --start 1 `
+  --stop 10
 ```
 
 after pdf_grabber.py has finished:
@@ -26,7 +26,7 @@ python medicare/google_them/pdf_validator.py `
 
 To debug pdf_grabber.py logs:
 ```
-python analyze_debug_json.py `
+python medicare/google_them/analyze_debug_json.py `
   --debug-dir medicare/google_them/testrun/debug_json `
   --output medicare/google_them/testrun/analysis.csv
 ```
