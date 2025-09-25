@@ -2067,8 +2067,210 @@ Do you want me to stub out that **Stage 2 downloader** now, so you can run the f
 
 ------------------------------------------------------------------------------------------------
 
-------------------------------------------------------------------------------------------------
+You’re absolutely right — your `pdf_grabber.py` is **maximizing recall** right now, but at the cost of a lot of API calls. For just two plans → 29 requests means the scaling won’t be sustainable. Let’s break down where the extra queries come from:
+
+---
+
+### Where the overhead comes from
+
+* **Both raw and normalized plan IDs** are searched. (2× multiplier)
+* For each ID variant:
+
+  * **Broad query** (N pages, default 3 → 30 results).
+  * **Targeted queries for each doc type** (SoB, EoC, Formulary). Each also paged. (3 × N pages → 90 results).
+* That’s 4 query “tracks” per ID variant. With 2 ID variants × 3 pages each = 24 requests per plan minimum.
+
+Even for small samples, this is ballooning.
+
+---
+
+### Optimization levers
+
+We can trim this in several ways:
+
+1. **Single broad search first**
+
+   * Run **only the broad query (raw + normalized)** for each plan.
+   * Categorize all results (cross-label as you’re already doing).
+   * In practice, you often get all 3 doc types in one query (as you saw with `H4513-077-3`).
+
+2. **Conditional targeted search**
+
+   * Only run targeted queries if a required doc type (SoB or EoC) is still missing after the broad search.
+   * Skip formulary-only targeted queries (since it’s optional).
+
+   → That could cut your request volume by **\~70%**.
+
+3. **Reduce pages**
+
+   * Often the **first 1–2 pages (10–20 results)** cover everything.
+   * We could default to 2 pages broad, then fall back to targeted with 1–2 pages.
+
+   → Big drop in API load, minimal recall loss.
+
+4. **De-duplicate search variants**
+
+   * If raw and normalized plan IDs are **identical** (normalize didn’t change anything), only run one.
+   * You’re already checking, but maybe worth logging how often normalized ≠ raw — it may be rare outside Humana.
+
+---
+
+### Suggested strategy (per plan)
+
+1. Run broad search (raw + normalized).
+2. Categorize all candidates.
+3. If both SoB and EoC found → stop.
+4. Else → run targeted searches *only* for missing required docs (SoB/EoC).
+5. Don’t ever run targeted formulary queries unless we decide later it’s worth the budget.
+
+---
+
+### Why this helps
+
+* Cuts from \~24+ requests per plan → \~4–6 requests in the common case (broad search finds everything).
+* Targeted queries only kick in when we’re missing required docs.
+* Keeps the recall high but drastically lowers cost.
+
+---
+
+⚡ Next step: I can refactor your `pdf_grabber.py` loop to implement **conditional targeted searches** with early stopping. That way you’ll see exactly how many requests per plan are being used (we’ll log it per-plan), and you’ll have a concrete baseline for performance vs cost.
+
+Do you want me to draft that optimized loop so you can test it on your sample 2–10 plans and compare request counts directly?
 
 ------------------------------------------------------------------------------------------------
+
+Everything except #4 sounds like a great suggestion, especially conditional targeted search.  If we already have a doc type then we don't want to bother target searching for it, and with solid conditional targeted search then we can probably afford to search for formulary when missing.
+
+I also agree with reducing pages.  In fact, I want the order of operation (and priority), to go like this:
+
+1. Broad search for raw plan ID, get first 2 pages, and categorize
+2. Targeted search for only missing doctypes, and only get first page
+3. If any doctype still has 0 candidates, Broad search for normalized planID, get first 2 pages
+4. Targeted search for only still missing doctypes using normalized planID, and only get first page
+
+------------------------------------------------------------------------------------------------
+
+Perfect 👍 — that’s a clear, staged strategy that balances recall with API budget.
+Here’s what it buys you:
+
+* **Broad first** → catch everything “for free” in just 2 pages.
+* **Target only missing** → don’t waste queries for docs you already have.
+* **Fallback to normalized** → only if raw didn’t work.
+* **Formulary included** → but only if missing (since optional).
+
+---
+
+### Optimized query plan per plan
+
+| Step | ID variant | Query type | Pages | Condition                         |
+| ---- | ---------- | ---------- | ----- | --------------------------------- |
+| 1    | Raw        | Broad      | 2     | Always                            |
+| 2    | Raw        | Targeted   | 1     | For each missing doc type         |
+| 3    | Normalized | Broad      | 2     | If any required doc still missing |
+| 4    | Normalized | Targeted   | 1     | For each still missing doc type   |
+
+---
+
+### Logging & Metrics
+
+We’ll add:
+
+* **Per-plan request count** (so you can compare to old \~24+ baseline).
+* Log whether SoB/EoC/Formulary were found at each stage.
+* Flag plans that still have 0 candidates after full sequence.
+
+---
+
+### Implementation approach
+
+We can adjust your `main()` loop in `pdf_grabber.py` like so:
+
+* Maintain `candidates` dict per plan → `{SoB:[], EoC:[], Formulary:[]}`.
+* Run search stages in order, append categorized results.
+* After each stage, check what’s missing.
+* Stop early if all doc types found.
+* Track number of API calls.
+
+---
+
+Would you like me to:
+
+1. Write a **full edited version of `pdf_grabber.py`** with this staged strategy and request counting/logging,
+   OR
+2. Just sketch the **loop structure changes** so you can patch it yourself?
+
+------------------------------------------------------------------------------------------------
+
+Just the loop structure changes, I'll patch myself
+
+------------------------------------------------------------------------------------------------
+
+Got it — here’s the **loop structure change** sketch for your `main()` that implements the staged strategy you described:
+
+```python
+for idx, plan in enumerate(reader, start=1):
+    if idx < start_idx or idx > stop_idx:
+        continue
+
+    plan_id = (plan.get("plan_id") or "").strip()
+    plan_name = (plan.get("plan_name") or "").strip()
+    norm_id = normalize_plan_id(plan_id)
+
+    logger.info(f"[INFO] ({idx}/{total}) Collecting candidates for {plan_id} {plan_name}")
+    request_count = 0
+    candidates = {d: [] for d in DOC_TYPES}  # SoB, EoC, Formulary
+
+    # --- Stage 1: Broad search raw ID (2 pages)
+    broad_raw = api_collect_candidates(plan_id, plan_name, label="broad", pages=2, debug_dir=debug_dir)
+    request_count += 2
+    for row in broad_raw:
+        candidates[row["doc_label"]].append(row)
+        out_writer.writerow(row)
+    out_fh.flush()
+
+    # --- Stage 2: Targeted search raw ID (1 page each, only if missing)
+    for doc_label in DOC_TYPES:
+        if not candidates[doc_label]:  # only if missing
+            res = api_collect_candidates(plan_id, plan_name, label=doc_label, pages=1, debug_dir=debug_dir)
+            request_count += 1
+            for row in res:
+                candidates[row["doc_label"]].append(row)
+                out_writer.writerow(row)
+            out_fh.flush()
+
+    # --- Stage 3: Broad search normalized ID (2 pages, only if still missing required docs)
+    if (not candidates["Summary_of_Benefits"]) or (not candidates["Evidence_of_Coverage"]):
+        broad_norm = api_collect_candidates(norm_id, plan_name, label="broad", pages=2, debug_dir=debug_dir)
+        request_count += 2
+        for row in broad_norm:
+            candidates[row["doc_label"]].append(row)
+            out_writer.writerow(row)
+        out_fh.flush()
+
+    # --- Stage 4: Targeted search normalized ID (1 page each, only if still missing)
+    for doc_label in DOC_TYPES:
+        if not candidates[doc_label]:  # only if missing
+            res = api_collect_candidates(norm_id, plan_name, label=doc_label, pages=1, debug_dir=debug_dir)
+            request_count += 1
+            for row in res:
+                candidates[row["doc_label"]].append(row)
+                out_writer.writerow(row)
+            out_fh.flush()
+
+    # --- Log summary
+    summary_bits = [f"{d}={len(candidates[d])}" for d in DOC_TYPES]
+    logger.info(f"[SUMMARY] ({idx}/{total}) {plan_id} → {', '.join(summary_bits)} | requests={request_count}")
+```
+
+---
+
+✨ Key things to note:
+
+* **`request_count`** is incremented based on how many pages we query at each stage.
+* **Conditional targeted search**: only runs if that doc type is missing.
+* **Normalized ID fallback** only triggers if SoB or EoC are missing.
+* All candidate rows are still written to CSV as before.
+
+Would you like me to also sketch how to **early-stop per-plan** once SoB & EoC are found (since those are mandatory, and formulary is optional)? That would shave off a few more API calls.
 
 ------------------------------------------------------------------------------------------------

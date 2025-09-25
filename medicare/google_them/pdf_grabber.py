@@ -230,48 +230,55 @@ def main():
     for idx, plan in enumerate(reader, start=1):
         if idx < start_idx or idx > stop_idx:
             continue
+
         plan_id = (plan.get("plan_id") or "").strip()
         plan_name = (plan.get("plan_name") or "").strip()
+        norm_id = normalize_plan_id(plan_id)
 
         logger.info(f"[INFO] ({idx}/{total}) Collecting candidates for {plan_id} {plan_name}")
+        request_count = 0
+        candidates = {d: [] for d in DOC_TYPES}  # SoB, EoC, Formulary
 
-        id_variants = [plan_id]
-        norm = normalize_plan_id(plan_id)
-        if norm != plan_id:
-            id_variants.append(norm)
+        # --- Stage 1: Broad search raw ID (2 pages)
+        broad_raw = api_collect_candidates(plan_id, plan_name, label="broad", pages=2, debug_dir=debug_dir)
+        request_count += 2
+        for row in broad_raw:
+            candidates[row["doc_label"]].append(row)
+            out_writer.writerow(row)
+        out_fh.flush()
 
-        found_labels = set()
-
-        for pid in id_variants:
-            # Broad search
-            cands = api_collect_candidates(pid, plan_name, label="broad", pages=args.pages, debug_dir=debug_dir)
-            for row in cands:
-                out_writer.writerow(row)
-                per_plan_counts[plan_id][row["doc_label"]] += 1
-                found_labels.add(row["doc_label"])
-            out_fh.flush()
-
-            # Targeted search
-            for doc_label in DOC_TYPES.keys():
-                cands = api_collect_candidates(pid, plan_name, label=doc_label, pages=args.pages, debug_dir=debug_dir)
-                for row in cands:
+        # --- Stage 2: Targeted search raw ID (1 page each, only if missing)
+        for doc_label in DOC_TYPES:
+            if not candidates[doc_label]:  # only if missing
+                res = api_collect_candidates(plan_id, plan_name, label=doc_label, pages=1, debug_dir=debug_dir)
+                request_count += 1
+                for row in res:
+                    candidates[row["doc_label"]].append(row)
                     out_writer.writerow(row)
-                    per_plan_counts[plan_id][row["doc_label"]] += 1
-                    found_labels.add(row["doc_label"])
                 out_fh.flush()
 
-        # Update plan-level stats
-        stats["plans_processed"] += 1
-        if "Summary_of_Benefits" in found_labels:
-            stats["plans_with_sob"] += 1
-        if "Evidence_of_Coverage" in found_labels:
-            stats["plans_with_eoc"] += 1
-        if "Drug_Formulary" in found_labels:
-            stats["plans_with_formulary"] += 1
-        if {"Summary_of_Benefits","Evidence_of_Coverage"}.issubset(found_labels):
-            stats["plans_complete"] += 1
+        # --- Stage 3: Broad search normalized ID (2 pages, only if still missing required docs)
+        if (not candidates["Summary_of_Benefits"]) or (not candidates["Evidence_of_Coverage"]):
+            broad_norm = api_collect_candidates(norm_id, plan_name, label="broad", pages=2, debug_dir=debug_dir)
+            request_count += 2
+            for row in broad_norm:
+                candidates[row["doc_label"]].append(row)
+                out_writer.writerow(row)
+            out_fh.flush()
 
-        logger.info(f"[SUMMARY] ({idx}/{total}) {plan_id} → candidates={dict(per_plan_counts[plan_id])}")
+        # --- Stage 4: Targeted search normalized ID (1 page each, only if still missing)
+        for doc_label in DOC_TYPES:
+            if not candidates[doc_label]:  # only if missing
+                res = api_collect_candidates(norm_id, plan_name, label=doc_label, pages=1, debug_dir=debug_dir)
+                request_count += 1
+                for row in res:
+                    candidates[row["doc_label"]].append(row)
+                    out_writer.writerow(row)
+                out_fh.flush()
+
+        # --- Log summary
+        summary_bits = [f"{d}={len(candidates[d])}" for d in DOC_TYPES]
+        logger.info(f"[SUMMARY] ({idx}/{total}) {plan_id} → {', '.join(summary_bits)} | requests={request_count}")
 
     out_fh.close()
 
