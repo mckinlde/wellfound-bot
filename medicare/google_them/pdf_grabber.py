@@ -239,13 +239,18 @@ def main():
         request_count = 0
         candidates = {d: [] for d in DOC_TYPES}  # SoB, EoC, Formulary
 
-        # --- Stage 1: Broad search raw ID (2 pages)
+            # --- Stage 1: Broad search raw ID (2 pages)
         broad_raw = api_collect_candidates(plan_id, plan_name, label="broad", pages=2, debug_dir=debug_dir)
         request_count += 2
         for row in broad_raw:
             candidates[row["doc_label"]].append(row)
             out_writer.writerow(row)
         out_fh.flush()
+
+        # Early stop check
+        if candidates["Summary_of_Benefits"] and candidates["Evidence_of_Coverage"]:
+            logger.info(f"[STOP] {plan_id}: SoB and EoC found in broad search (raw ID)")
+            continue
 
         # --- Stage 2: Targeted search raw ID (1 page each, only if missing)
         for doc_label in DOC_TYPES:
@@ -257,6 +262,11 @@ def main():
                     out_writer.writerow(row)
                 out_fh.flush()
 
+        # Early stop check
+        if candidates["Summary_of_Benefits"] and candidates["Evidence_of_Coverage"]:
+            logger.info(f"[STOP] {plan_id}: SoB and EoC found after targeted search (raw ID)")
+            continue
+
         # --- Stage 3: Broad search normalized ID (2 pages, only if still missing required docs)
         if (not candidates["Summary_of_Benefits"]) or (not candidates["Evidence_of_Coverage"]):
             broad_norm = api_collect_candidates(norm_id, plan_name, label="broad", pages=2, debug_dir=debug_dir)
@@ -265,6 +275,11 @@ def main():
                 candidates[row["doc_label"]].append(row)
                 out_writer.writerow(row)
             out_fh.flush()
+
+        # Early stop check
+        if candidates["Summary_of_Benefits"] and candidates["Evidence_of_Coverage"]:
+            logger.info(f"[STOP] {plan_id}: SoB and EoC found in broad search (normalized ID)")
+            continue
 
         # --- Stage 4: Targeted search normalized ID (1 page each, only if still missing)
         for doc_label in DOC_TYPES:
@@ -276,9 +291,10 @@ def main():
                     out_writer.writerow(row)
                 out_fh.flush()
 
-        # --- Log summary
+        # Done: log how many candidates per doc type
         summary_bits = [f"{d}={len(candidates[d])}" for d in DOC_TYPES]
         logger.info(f"[SUMMARY] ({idx}/{total}) {plan_id} → {', '.join(summary_bits)} | requests={request_count}")
+
 
     out_fh.close()
 
