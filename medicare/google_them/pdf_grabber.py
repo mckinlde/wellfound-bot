@@ -24,7 +24,9 @@ from collections import Counter, defaultdict
 # Setup
 # ---------------------------
 
-LOG_FILE = "medicare/google_them/google_pdf_grabber.log"
+LOG_DIR = "medicare/google_them/testrun/"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = "medicare/google_them/testrun/google_pdf_grabber.log"
 logger = logging.getLogger("pdf_grabber")
 
 DOC_TYPES = {

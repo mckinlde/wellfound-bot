@@ -96,4 +96,4 @@ if __name__ == "__main__":
 # Usage:
 # python medicare/google_them/analyze_candidates_csv.py `
 #   --input medicare/google_them/testrun/candidates.csv `
-#   --output medicare/google_them/candidates_summary.csv
+#   --output medicare/google_them/testrun/candidates_summary.csv
