@@ -18,6 +18,7 @@ import sys, re, os
 import argparse
 from time import sleep
 from urllib.parse import urljoin
+import logging
 
 import pandas as pd
 from selenium.webdriver.common.by import By
@@ -36,6 +37,12 @@ from utils.SPA_utils import wait_scroll_interact, _safe_click_element
 BASE_ORIGIN = "https://healthy.kaiserpermanente.org/shop-plans/ready-for-medicare/explore-plans#/"
 BASE_URL = f"{BASE_ORIGIN}"
 OUTPUT_DIR = "kaiser_PDFs"
+
+LOG_DIR = "medicare/kaiser/testrun/"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = "medicare/kaiser/testrun/kaiser_pdf_grabber.log"
+logger = logging.getLogger("kaiser_pdf_grabber")
+
 
 DOC_LABELS = [
     "Summary of Benefits",
@@ -205,7 +212,9 @@ def download_pdf(session, url: str, out_path: str):
         with open(out_path, "wb") as f:
             f.write(resp.content)
         print(f"    [OK] {os.path.basename(out_path)}")
+        logger.info(f"    [OK] {os.path.basename(out_path)}")
     except Exception as e:
+        logger.error(f"    [ERROR] {url}: {e}")
         print(f"    [ERROR] {url}: {e}")
 
 
@@ -214,6 +223,7 @@ def main(start_n: int, stop_n: int | None):
     total = len(plans)
     if total == 0:
         print("[ERROR] No plans found in kaiser_plan_links.csv")
+        logger.error("[ERROR] No plans found in kaiser_plan_links.csv")
         return
 
     # Normalize 1-based indices
@@ -230,6 +240,8 @@ def main(start_n: int, stop_n: int | None):
 
     print(f"[INFO] Total plans: {total}")
     print(f"[INFO] Processing progress range: {start_n}..{stop_n} (inclusive)")
+    logger.info(f"[INFO] Total plans: {total}")
+    logger.info(f"[INFO] Processing progress range: {start_n}..{stop_n} (inclusive)")
 
     with start_driver() as driver:
         session = make_requests_session_from_driver(driver)
@@ -237,10 +249,12 @@ def main(start_n: int, stop_n: int | None):
         for i in range(start_idx, stop_idx):
             zip_code, plan_name, plan_id = plans[i]
             print(f"[INFO] ({i+1}/{total}) {plan_id} {plan_name} ({zip_code})")
+            logger.info(f"[INFO] ({i+1}/{total}) {plan_id} {plan_name} ({zip_code})")
 
             pdfs = scrape_plan_pdfs(driver, zip_code, plan_name, plan_id)
             if not pdfs:
                 print("    [WARN] No PDFs found")
+                logger.info("    [WARN] No PDFs found")
                 sleep(2.0)
                 continue
 
@@ -252,6 +266,7 @@ def main(start_n: int, stop_n: int | None):
                 out_path = os.path.join(out_dir, filename)
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                     print(f"    [SKIP] {filename} (exists)")
+                    logger.info(f"    [SKIP] {filename} (exists)")
                     continue
                 download_pdf(session, href, out_path)
                 sleep(1.2)
