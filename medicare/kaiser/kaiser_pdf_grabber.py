@@ -165,30 +165,30 @@ def scrape_plan_pdfs(driver, zip_code: str, plan_name: str, plan_id: str) -> dic
     driver.get(BASE_URL)
     
     # Note: the page uses a lot of dynamic loading; we need to wait for elements to appear
-    sleep(2.0)  # initial wait for page to load
+    sleep(5)  # initial wait for page to load
     # After pageload, scroll down to the bottom to trigger lazy loading
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    sleep(2.0)  # wait for lazy load
+    sleep(5)  # wait for lazy load
     
     # Fill Zip code
     wait_scroll_interact(driver, By.CSS_SELECTOR, 'input[name="zipcodeValue"]', action="send_keys", keys=zip_code, timeout=10)
     # Small pause to let the dropdown populate
-    sleep(1)
+    sleep(5)
     # Now select the first suggestion
     select_first_zipcode_suggestion(driver, timeout=8)
-    sleep(2) # Wait for pageload
+    sleep(5) # Wait for pageload
     # And click Explore Plans
     wait_scroll_interact(driver, By.CSS_SELECTOR, 'button[id="explorePlansBtnText"]', action="click", timeout=10)
-    sleep(2)
+    sleep(5)
     # We should now be at plan list page, find the plan Name that matches
     # and click that plan's plan details button
     click_plan_details(driver, plan_name)
-    sleep(2)
+    sleep(5)
 
     # then we should be at the plan details page
     # click into the enrollment materials tab
     click_enrollment_materials_tab(driver)
-    sleep(2)
+    sleep(5)
 
     # and get the PDF links
     pdf_links = get_enrollment_pdfs(driver)
