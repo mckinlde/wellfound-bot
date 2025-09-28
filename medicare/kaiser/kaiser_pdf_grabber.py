@@ -192,7 +192,7 @@ def scrape_plan_pdfs(driver, zip_code: str, plan_name: str, plan_id: str) -> dic
 
     # and get the PDF links
     pdf_links = get_enrollment_pdfs(driver)
-    print(pdf_links)
+    # print(pdf_links)
     return pdf_links
 
 
