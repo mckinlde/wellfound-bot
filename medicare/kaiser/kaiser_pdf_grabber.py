@@ -168,34 +168,53 @@ def get_enrollment_pdfs(driver, timeout=10, base_url="https://healthy.kaiserperm
     return pdfs
 
 
+# ToDo: wire this in to wait_scroll_interact, etc.
+def click_when_ready(driver, button_locator, timeout=15):
+    wait = WebDriverWait(driver, timeout)
+
+    # Wait for the loading indicator to disappear
+    wait.until(EC.invisibility_of_element_located((By.CSS_SELECTOR, ".loading-indicator")))
+
+    # Wait for the button to be clickable
+    button = wait.until(EC.element_to_be_clickable(button_locator))
+
+    button.click()
+    """usage:
+    click_when_ready(
+        driver,
+        (By.CSS_SELECTOR, "#plan-details-btn-2")  # or whatever locator you use
+    )
+    """
+
+
 def scrape_plan_pdfs(driver, zip_code: str, plan_name: str, plan_id: str) -> dict:
     driver.get(BASE_URL)
     
     # Note: the page uses a lot of dynamic loading; we need to wait for elements to appear
-    sleep(5)  # initial wait for page to load
+    sleep(10)  # initial wait for page to load
     # After pageload, scroll down to the bottom to trigger lazy loading
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    sleep(5)  # wait for lazy load
+    sleep(10)  # wait for lazy load
     
     # Fill Zip code
     wait_scroll_interact(driver, By.CSS_SELECTOR, 'input[name="zipcodeValue"]', action="send_keys", keys=zip_code, timeout=10)
     # Small pause to let the dropdown populate
-    sleep(5)
+    sleep(10)
     # Now select the first suggestion
     select_first_zipcode_suggestion(driver, timeout=8)
-    sleep(5) # Wait for pageload
+    sleep(10) # Wait for pageload
     # And click Explore Plans
     wait_scroll_interact(driver, By.CSS_SELECTOR, 'button[id="explorePlansBtnText"]', action="click", timeout=10)
-    sleep(5)
+    sleep(10)
     # We should now be at plan list page, find the plan Name that matches
     # and click that plan's plan details button
     click_plan_details(driver, plan_name)
-    sleep(5)
+    sleep(10)
 
     # then we should be at the plan details page
     # click into the enrollment materials tab
     click_enrollment_materials_tab(driver)
-    sleep(5)
+    sleep(10)
 
     # and get the PDF links
     pdf_links = get_enrollment_pdfs(driver)
