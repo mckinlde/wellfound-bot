@@ -13,7 +13,10 @@ Ta-da, all the links on there
 corresponding row:
 WA,Asotin,53,99401,Wellcare,Wellcare Mutual of Omaha Premium Enhanced Open (PPO),Medicare Advantage with drug coverage,H5965-007-0,https://www.medicare.gov/plan-compare/#/plan-details/2025-H5965-007-0?fips=53003&plan_type=PLAN_TYPE_MAPD&zip=99401&year=2025&lang=en&page=1
 
-{state}/members/medicare-plans-2025/{plan_name_spaces_to_hyphens}+{plan_id[20++]}
+{state}/members/medicare-plans-2025/{plan_name_spaces_to_hyphens}-{plan_id[1]}
+
+https://www.wellcare.com/en/washington/members/medicare-plans-2025/wellcare-mutual-of-omaha-premium-enhanced-open-ppo-007
+
 """
 
 #!/usr/bin/env python3
@@ -35,6 +38,8 @@ import argparse
 from time import sleep
 from urllib.parse import urljoin
 import logging
+import csv
+import re
 
 import pandas as pd
 from selenium.webdriver.common.by import By
@@ -60,6 +65,91 @@ LOG_FILE = "medicare/centene/testrun/centene_pdf_grabber.log"
 logger = logging.getLogger("centene_pdf_grabber")
 
 
+state_options = {
+    "AL":"Alabama",
+    "AK":"Alaska",
+    "AZ":"Arizona",
+    "AR":"Arkansas",
+    "CA":"California",
+    "CO":"Colorado",
+    "CT":"Connecticut",
+    "DE":"Delaware",
+    "DC":"District of Columbia",
+    "FL":"Florida",
+    "GA":"Georgia",
+    "HI":"Hawaii",
+    "ID":"Idaho",
+    "IL":"Illinois",
+    "IN":"Indiana",
+    "IA":"Iowa",
+    "KS":"Kansas",
+    "KY":"Kentucky",
+    "LA":"Louisiana",
+    "ME":"Maine",
+    "MD":"Maryland",
+    "MA":"Massachusetts",
+    "MI":"Michigan",
+    "MN":"Minnesota",
+    "MS":"Mississippi",
+    "MO":"Missouri",
+    "MT":"Montana",
+    "NE":"Nebraska",
+    "NV":"Nevada",
+    "NH":"New Hampshire",
+    "NJ":"New Jersey",
+    "NM":"New Mexico",
+    "NY":"New York",
+    "NC":"North Carolina",
+    "ND":"North Dakota",
+    "OH":"Ohio",
+    "OK":"Oklahoma",
+    "OR":"Oregon",
+    "PA":"Pennsylvania",
+    "RI":"Rhode Island",
+    "SC":"South Carolina",
+    "SD":"South Dakota",
+    "TN":"Tennessee",
+    "TX":"Texas",
+    "UT":"Utah",
+    "VT":"Vermont",
+    "VA":"Virginia",
+    "WA":"Washington",
+    "WV":"West Virginia",
+    "WI":"Wisconsin",
+    "WY":"Wyoming",
+}
+
+# # unused, implemented directly in load_plan_details
+# def format_plan_links(csv_path):
+#     output = []
+#     with open(csv_path, newline="", encoding="utf-8") as f:
+#         reader = csv.reader(f)
+#         for row in reader:
+#             state, county, fips, zip_code, company, plan_name, plan_type, plan_id, url = row
+
+#             # Convert state code → full state name (lowercase, spaces removed)
+#             state_full = state_options.get(state, state).lower().replace(" ", "-")
+
+#             # Normalize plan name
+#             name = plan_name.lower()
+#             name = re.sub(r"[()]", "", name)       # remove parentheses
+#             name = re.sub(r"\s+", "-", name)       # spaces → hyphen
+#             name = re.sub(r"-+", "-", name)        # collapse multiple hyphens
+
+#             # Get 2nd segment of plan_id
+#             segments = plan_id.split("-")
+#             suffix = segments[1] if len(segments) > 1 else ""
+
+#             formatted = f"{state_full}/members/medicare-plans-2025/{name}-{suffix}"
+#             output.append(formatted)
+#     return output
+
+# # Example usage
+# csv_file = "centene_plan_links.csv"
+# for link in format_plan_links(csv_file):
+#     print(link)
+# input("stop")
+
 DOC_LABELS = [
     "Summary of Benefits",
     "Evidence of Coverage",
@@ -67,56 +157,9 @@ DOC_LABELS = [
 ]
 
 
-
-
 def safe_name(s: str) -> str:
     """Filesystem-safe name (Windows-friendly)."""
     return re.sub(r"[^A-Za-z0-9._\-]+", "_", s)
-
-
-def get_enrollment_pdfs(driver, timeout=10, base_url="https://healthy.centenepermanente.org"):
-    """
-    Scrapes the Enrollment Materials tab for Summary of Benefits, 
-    Evidence of Coverage, and Drug Formulary PDF links.
-    
-    Returns a dict of {label: url}
-    """
-    wait = WebDriverWait(driver, timeout)
-    pdfs = {}
-
-    # --- Summary of Benefits ---
-    try:
-        sob_link = wait.until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "#benefitSummaryWrapper ul.region-document a")
-            )
-        )
-        pdfs["Summary of Benefits"] = sob_link.get_attribute("href")
-    except Exception:
-        pdfs["Summary of Benefits"] = None
-
-    # --- Evidence of Coverage ---
-    try:
-        eoc_link = driver.find_element(By.CSS_SELECTOR, "#evidenceWrapper ul.region-document a")
-        pdfs["Evidence of Coverage"] = eoc_link.get_attribute("href")
-    except Exception:
-        pdfs["Evidence of Coverage"] = None
-
-    # --- Drug Formulary ---
-    try:
-        formulary_link = driver.find_element(
-            By.XPATH, '//a[contains(@href, "/formularies/medicare/2025/")]'
-        )
-        pdfs["Drug Formulary"] = formulary_link.get_attribute("href")
-    except Exception:
-        pdfs["Drug Formulary"] = None
-
-    # normalize URLs (if relative paths like "/content/dam/...")
-    for key, val in pdfs.items():
-        if val and val.startswith("/"):
-            pdfs[key] = base_url.rstrip("/") + val
-
-    return pdfs
 
 
 # ToDo: wire this in to wait_scroll_interact, etc.
@@ -138,40 +181,33 @@ def click_when_ready(driver, button_locator, timeout=15):
     """
 
 
-def scrape_plan_pdfs(driver, zip_code: str, plan_name: str, plan_id: str) -> dict:
-    driver.get(BASE_URL)
-    
-    # Note: the page uses a lot of dynamic loading; we need to wait for elements to appear
-    sleep(10)  # initial wait for page to load
-    # After pageload, scroll down to the bottom to trigger lazy loading
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    sleep(10)  # wait for lazy load
-    
-    # Fill Zip code
-    wait_scroll_interact(driver, By.CSS_SELECTOR, 'input[name="zipcodeValue"]', action="send_keys", keys=zip_code, timeout=10)
-    # Small pause to let the dropdown populate
-    sleep(10)
-    # Now select the first suggestion
-    select_first_zipcode_suggestion(driver, timeout=8)
-    sleep(10) # Wait for pageload
-    # And click Explore Plans
-    wait_scroll_interact(driver, By.CSS_SELECTOR, 'button[id="explorePlansBtnText"]', action="click", timeout=10)
-    sleep(10)
-    # We should now be at plan list page, find the plan Name that matches
-    # and click that plan's plan details button
-    click_plan_details(driver, plan_name)
-    sleep(10)
+def get_enrollment_pdfs(driver, timeout=10):
+    """
+    Scrapes the current page for PDF links.
 
-    # then we should be at the plan details page
-    # click into the enrollment materials tab
-    click_enrollment_materials_tab(driver)
-    sleep(10)
+    Returns a dict of {label: url}
+    """
+    wait = WebDriverWait(driver, timeout)
+    pdfs = {}
 
-    # and get the PDF links
-    pdf_links = get_enrollment_pdfs(driver)
-    # print(pdf_links)
-    return pdf_links
+    # Wait for any <a> with href ending in .pdf to appear
+    anchors = wait.until(
+        EC.presence_of_all_elements_located((By.XPATH, "//a[contains(@href, '.pdf')]"))
+    )
 
+    for a in anchors:
+        try:
+            href = a.get_attribute("href")
+            text = a.text.strip()
+            if href and href.lower().endswith(".pdf"):
+                # Clean label for filenames
+                label = re.sub(r"\s+", "_", text)
+                label = re.sub(r"[^A-Za-z0-9_]+", "", label)  # strip weird chars
+                pdfs[label] = href
+        except Exception:
+            continue
+
+    return pdfs
 
 
 def download_pdf(session, url: str, out_path: str):
@@ -182,21 +218,49 @@ def download_pdf(session, url: str, out_path: str):
         with open(out_path, "wb") as f:
             f.write(resp.content)
         print(f"    [OK] {os.path.basename(out_path)}")
-        logger.info(f"    [OK] {os.path.basename(out_path)}")
     except Exception as e:
-        logger.error(f"    [ERROR] {url}: {e}")
         print(f"    [ERROR] {url}: {e}")
 
 
-def main(start_n: int, stop_n: int | None):
-    plans = load_plan_details()
+
+def load_plan_details(csv_path="centene_plan_links.csv"):
+    """
+    Load plan details from CSV.
+    Returns a list of tuples: (zip_code, plan_name, plan_id, fragment)
+    """
+    plans = []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            state, county, fips, zip_code, company, plan_name, plan_type, plan_id, url = row
+
+            # State code → full name (lowercase, spaces → hyphens)
+            state_full = state_options.get(state, state).lower().replace(" ", "-")
+
+            # Normalize plan name
+            name = plan_name.lower()
+            name = re.sub(r"[()]", "", name)      # remove parentheses
+            name = re.sub(r"\s+", "-", name)      # spaces → hyphen
+            name = re.sub(r"-+", "-", name)       # collapse multiple hyphens
+
+            # Use 2nd segment of plan_id
+            segments = plan_id.split("-")
+            suffix = segments[1] if len(segments) > 1 else ""
+
+            fragment = f"{state_full}/members/medicare-plans-2025/{name}-{suffix}"
+            plans.append((zip_code, plan_name, plan_id, fragment))
+    return plans
+
+
+def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
+    plans = load_plan_details(csv_path)
     total = len(plans)
     if total == 0:
         print("[ERROR] No plans found in centene_plan_links.csv")
         logger.error("[ERROR] No plans found in centene_plan_links.csv")
         return
 
-    # Normalize 1-based indices
+    # Normalize indices
     if start_n < 1:
         start_n = 1
     if stop_n is None or stop_n > total:
@@ -206,7 +270,7 @@ def main(start_n: int, stop_n: int | None):
         return
 
     start_idx = start_n - 1
-    stop_idx = stop_n  # slice end is exclusive
+    stop_idx = stop_n
 
     print(f"[INFO] Total plans: {total}")
     print(f"[INFO] Processing progress range: {start_n}..{stop_n} (inclusive)")
@@ -217,11 +281,21 @@ def main(start_n: int, stop_n: int | None):
         session = make_requests_session_from_driver(driver)
 
         for i in range(start_idx, stop_idx):
-            zip_code, plan_name, plan_id = plans[i]
+            zip_code, plan_name, plan_id, fragment = plans[i]
+            url = f"https://www.wellcare.com/en/{fragment}"
+
             print(f"[INFO] ({i+1}/{total}) {plan_id} {plan_name} ({zip_code})")
             logger.info(f"[INFO] ({i+1}/{total}) {plan_id} {plan_name} ({zip_code})")
 
-            pdfs = scrape_plan_pdfs(driver, zip_code, plan_name, plan_id)
+            try:
+                driver.get(url)
+                sleep(2.0)
+                pdfs = get_enrollment_pdfs(driver)
+            except Exception as e:
+                print(f"    [ERROR] navigation failed for {plan_id}: {e}")
+                logger.error(f"    [ERROR] navigation failed for {plan_id}: {e}")
+                continue
+
             if not pdfs:
                 print("    [WARN] No PDFs found")
                 logger.info("    [WARN] No PDFs found")
@@ -231,13 +305,20 @@ def main(start_n: int, stop_n: int | None):
             out_dir = os.path.join(OUTPUT_DIR, plan_id)
             os.makedirs(out_dir, exist_ok=True)
 
+            print(f"    [FOUND {len(pdfs)} PDFs]")
+            logger.info(f"    [FOUND {len(pdfs)} PDFs]")
             for label, href in pdfs.items():
+                print(f"      -> {label}: {href}")
+                logger.info(f"      -> {label}: {href}")
+
                 filename = f"{safe_name(plan_id)}_{safe_name(label)}.pdf"
                 out_path = os.path.join(out_dir, filename)
+
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                     print(f"    [SKIP] {filename} (exists)")
                     logger.info(f"    [SKIP] {filename} (exists)")
                     continue
+
                 download_pdf(session, href, out_path)
                 sleep(1.2)
 
