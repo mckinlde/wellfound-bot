@@ -312,216 +312,129 @@ we're not getting accurate plan labels:
 [INFO] Metadata saved to testrun/centene_metadata.json
 [INFO] Metadata saved to testrun/centene_metadata.csv
 -----
-Ah, I see what’s happening. Right now your `get_enrollment_pdfs()` is falling back to `a.text` (which is often just “Download”), so all anchors collapse into `plan_file`, `plan_file_2`, etc. That’s why your filenames are generic.
+You’re right—the reason we kept getting `plan_file` is that the label isn’t on the `<a>` at all. On Wellcare’s plan pages the human-readable label (“Annual Notice of Change”, “Summary of Benefits”, etc.) lives inside the **left column** of each `.mod-item-container`, specifically in a `<label>` element (`.large-9.columns > label`). The `<a>` on the right has `title="plan file"` so anything derived from the link will be junk.
 
-Looking at the WellCare HTML you shared earlier, the **true labels** (like *Annual Notice of Change*, *Summary of Benefits*, *Evidence of Coverage*, etc.) aren’t on the `<a>` element. They live in sibling `<div>` or `<span>` containers near the PDF link.
+Drop in the function below. It:
 
----
+* Reads the label from `div.large-9.columns > label` (or any `<label>` as a fallback).
+* Normalizes it to filesystem-safe.
+* Treats any link containing `.pdf` or `.ashx` as a document (handles `?query` too).
+* Detects language from the URL (`_spa_`, `/es/`, etc.) or from the container’s text.
+* De-dupes labels by appending a counter.
 
-### Fix: Extract the *document title* from the container instead of just the `<a>` text
-
-Here’s how you can update `get_enrollment_pdfs`:
+Replace your `get_enrollment_pdfs` with this:
 
 ```python
-def get_enrollment_pdfs(driver, timeout=15, scroll_pause=1.0):
+def _norm_label(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"\s+", "_", s)
+    return re.sub(r"[^A-Za-z0-9_]+", "", s)
+
+def _looks_like_pdf(url: str) -> bool:
+    u = url.lower()
+    return (".pdf" in u) or (".ashx" in u)
+
+def get_enrollment_pdfs(driver, timeout=20, scroll_pause=0.8):
     """
     Scrapes the current plan details page for ALL enrollment-related PDFs.
-    Returns dict of {label: url}, using the visible document titles, not just "Download".
+    Returns dict of {label: url}, using the visible label in the left column of each row.
     """
     wait = WebDriverWait(driver, timeout)
-    pdfs = {}
+    pdfs: dict[str, str] = {}
 
-    # Wait for at least one PDF link
-    wait.until(EC.presence_of_all_elements_located(
-        (By.XPATH, "//a[contains(@href, '.pdf') or contains(@href, '.ashx')]")
-    ))
+    # 1) Wait for the rows to exist
+    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".mod-item-container")))
 
-    # Scroll for lazy loading
-    last_height = driver.execute_script("return document.body.scrollHeight")
+    # 2) Lazy-load scroll
+    last_h = driver.execute_script("return document.body.scrollHeight")
     while True:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         sleep(scroll_pause)
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
+        new_h = driver.execute_script("return document.body.scrollHeight")
+        if new_h == last_h:
             break
-        last_height = new_height
+        last_h = new_h
 
-    # Each document lives in .mod-item-container
+    # 3) Walk rows, extract the human label from the left column, then collect links
     containers = driver.find_elements(By.CSS_SELECTOR, ".mod-item-container")
-    for container in containers:
+    for idx, container in enumerate(containers, start=1):
         try:
-            # Document title is usually in the container text before "Download"
-            heading_el = container.find_element(By.CSS_SELECTOR, ".title, h3, strong, span")
-            doc_title = heading_el.text.strip() if heading_el else ""
-        except Exception:
-            doc_title = ""
+            # The visible text label is here:
+            try:
+                lbl_el = container.find_element(By.CSS_SELECTOR, "div.large-9.columns > label")
+            except Exception:
+                # Fallback: any label in this row
+                lbl_el = container.find_element(By.TAG_NAME, "label")
+            base_label = _norm_label(lbl_el.text) if lbl_el and lbl_el.text.strip() else f"plan_file_{idx}"
 
-        anchors = container.find_elements(By.TAG_NAME, "a")
-        for a in anchors:
-            href = a.get_attribute("href")
-            if not href:
-                continue
-            if not (href.lower().endswith(".pdf") or href.lower().endswith(".ashx")):
-                continue
+            # We’ll also use surrounding text to infer language when the URL doesn’t help
+            row_text = container.text.lower()
 
-            # Use container heading text if available, otherwise fallback
-            label = doc_title or (a.get_attribute("title") or a.text or os.path.basename(href))
+            # Collect all candidate links in this row
+            anchors = container.find_elements(By.CSS_SELECTOR, "a[href]")
+            for a in anchors:
+                href = a.get_attribute("href") or ""
+                if not _looks_like_pdf(href):
+                    continue
 
-            # Normalize
-            label = re.sub(r"\s+", "_", label)
-            label = re.sub(r"[^A-Za-z0-9_]+", "", label)
+                # Absolute URL
+                if href.startswith("/"):
+                    href = "https://www.wellcare.com" + href
 
-            # Detect language
-            lang = None
-            href_lower = href.lower()
-            if "spanish" in href_lower or "es_" in href_lower or "/es/" in href_lower:
-                lang = "es"
-            elif "english" in href_lower or "en_" in href_lower or "/en/" in href_lower:
-                lang = "en"
-            if lang:
-                label = f"{label}_{lang}"
+                # Language detection (URL first, then row text as fallback)
+                h = href.lower()
+                lang = None
+                if any(tok in h for tok in ["_spa_", "/es/", "spanish"]):
+                    lang = "es"
+                elif any(tok in h for tok in ["_eng_", "/en/", "english"]):
+                    lang = "en"
+                else:
+                    if "spanish" in row_text and "english" not in row_text:
+                        lang = "es"
+                    elif "english" in row_text and "spanish" not in row_text:
+                        lang = "en"
 
-            # Avoid collisions
-            if label in pdfs:
-                counter = 2
-                new_label = f"{label}_{counter}"
-                while new_label in pdfs:
-                    counter += 1
-                    new_label = f"{label}_{counter}"
-                label = new_label
+                label = f"{base_label}_{lang}" if lang else base_label
 
-            # Ensure full URL
-            if href.startswith("/"):
-                href = "https://www.wellcare.com" + href
+                # De-dupe if multiple links share the same label
+                final_label = label
+                n = 2
+                while final_label in pdfs:
+                    final_label = f"{label}_{n}"
+                    n += 1
 
-            pdfs[label] = href
+                pdfs[final_label] = href
+
+        except Exception as e:
+            print(f"    [WARN] error parsing container {idx}: {e}")
+            continue
 
     return pdfs
 ```
 
----
+Why this fixes it
 
-### 🔑 What Changed
+* We stopped using attributes on the `<a>` (which say “plan file”) and now read the **actual document caption** living in the left column `<label>`. On the sample pages you shared, that yields clean labels like:
 
-1. **Look for `.title`, `h3`, `strong`, or `span` inside `.mod-item-container`** to capture “Annual Notice of Change” etc.
-2. If not found, still fallback to anchor text/filename.
-3. Keep language suffix and collision handling.
+  * `Annual_Notice_of_Change`
+  * `Summary_of_Benefits`
+  * `Evidence_of_Coverage`
+  * `Electronic_Funds_Transfer_Request_Form`, etc.
+* We also switched the PDF test from “endswith” to “contains” so URLs like `...?foo.pdf?la=en-US` don’t get skipped.
 
----
-
-### Expected Output
-
-Instead of:
+You don’t need to change anything else in your script—the filenames will become:
 
 ```
-H1416-058-0_plan_file.pdf
-H1416-058-0_plan_file_2.pdf
-...
+centene_PDFs/H1416-058-0/
+  H1416-058-0_Annual_Notice_of_Change_en.pdf
+  H1416-058-0_Summary_of_Benefits_en.pdf
+  H1416-058-0_Evidence_of_Coverage_en.pdf
+  H1416-058-0_Dental_Benefit_Details_en.pdf
+  H1416-058-0_Plan_Enrollment_Form_en.pdf
+  H1416-058-0_Star_Ratings_en.pdf
+  H1416-058-0_Electronic_Funds_Transfer_Request_Form_en.pdf
+  H1416-058-0_Electronic_Funds_Transfer_Request_Form_es.pdf
+  ...
 ```
 
-You’ll now get:
-
-```
-H1416-058-0_Annual_Notice_of_Change_en.pdf
-H1416-058-0_Summary_of_Benefits_en.pdf
-H1416-058-0_Evidence_of_Coverage_en.pdf
-H1416-058-0_Dental_Benefit_Details_en.pdf
-...
-```
-
----
-
-Want me to adjust this further so that the **metadata JSON/CSV** also records both the *raw title* and the *normalized filename* (instead of just the cleaned-up label)? That way you preserve the original human-readable document names.
------
-can you check the page html file I gave you a while ago to see what exactly to look for to capture labels?
------
-I gave you the *diagnosis* and a sketch of what needs to change, but I didn’t actually drop in a finished replacement for your function yet 🙂.
-
-Right now your `get_enrollment_pdfs()` loop just grabs `a.text` (or `aria-label` / `title`), which is why you’re seeing everything fall back to generic `plan_file_N`. On the WellCare pages, the human-friendly labels like **Annual Notice of Change** or **Summary of Benefits** aren’t on the `<a>` at all — they live in the same `.mod-item-container`, usually in a sibling `<span>` or `<div>`.
-
-Here’s a more concrete rewrite of the loop inside `get_enrollment_pdfs()` that should yield the right labels from your uploaded HTML structure:
-
-```python
-def get_enrollment_pdfs(driver, timeout=15, scroll_pause=1.0):
-    wait = WebDriverWait(driver, timeout)
-    pdfs = {}
-
-    # Wait for at least one PDF link to appear
-    wait.until(EC.presence_of_all_elements_located(
-        (By.XPATH, "//a[contains(@href, '.pdf') or contains(@href, '.ashx')]")
-    ))
-
-    # Scroll to bottom for lazy loading
-    last_height = driver.execute_script("return document.body.scrollHeight")
-    while True:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        sleep(scroll_pause)
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
-
-    # Each container holds a title + one or more anchors
-    containers = driver.find_elements(By.CSS_SELECTOR, ".mod-item-container")
-    for container in containers:
-        # grab the title text (e.g. "Annual Notice of Change")
-        try:
-            title_el = container.find_element(By.CSS_SELECTOR, ".title, span, strong")
-            base_label = title_el.text.strip()
-        except Exception:
-            base_label = None
-
-        anchors = container.find_elements(By.TAG_NAME, "a")
-        for idx, a in enumerate(anchors, start=1):
-            href = a.get_attribute("href")
-            if not href:
-                continue
-            if not (href.lower().endswith(".pdf") or href.lower().endswith(".ashx")):
-                continue
-
-            label = base_label or (a.text or "").strip()
-            if not label:
-                label = os.path.basename(href)
-
-            # If multiple anchors under same title (e.g. English + Spanish), append idx/lang
-            lang = None
-            href_lower = href.lower()
-            if "spanish" in href_lower or "/es/" in href_lower:
-                lang = "es"
-            elif "english" in href_lower or "/en/" in href_lower:
-                lang = "en"
-            if lang:
-                label = f"{label}_{lang}"
-            elif len(anchors) > 1:
-                label = f"{label}_{idx}"
-
-            # normalize label to filesystem-safe
-            label = re.sub(r"\s+", "_", label)
-            label = re.sub(r"[^A-Za-z0-9_]+", "", label)
-
-            # avoid collisions
-            if label in pdfs:
-                counter = 2
-                new_label = f"{label}_{counter}"
-                while new_label in pdfs:
-                    counter += 1
-                    new_label = f"{label}_{counter}"
-                label = new_label
-
-            # absolute URL
-            if href.startswith("/"):
-                href = "https://www.wellcare.com" + href
-
-            pdfs[label] = href
-
-    return pdfs
-```
-
-This way:
-
-* The function looks **inside `.mod-item-container`** for a title element (`.title`, `span`, or `strong`).
-* That title becomes your base label (`Annual_Notice_of_Change`, `Summary_of_Benefits`, etc.).
-* If multiple downloads exist under one title (EN/ES, etc.), they get suffixed `_en`, `_es`, or `_2`.
-* Fallbacks are still in place if no title exists.
-
-Would you like me to drop this straight into your full script for you, replacing the existing `get_enrollment_pdfs()`?
+If you still see `plan_file` after this, it would mean the row truly has no `<label>` element. In that rare case we fall back to `plan_file_{idx}`; if you run into such a row, shoot me the HTML for that single `.mod-item-container` and I’ll add a second fallback (e.g., grab the first text node in the left column).

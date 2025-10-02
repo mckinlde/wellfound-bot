@@ -65,36 +65,24 @@ os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = "testrun/centene_pdf_grabber.log"
 logger = logging.getLogger("centene_pdf_grabber")
 
-def save_metadata(metadata: dict, out_dir: str, success_count=0, fail_count=0,
+def save_metadata(saved_files_metadata: dict, out_dir: str, success_count=0, fail_count=0,
                   plans_succeeded=None, plans_failed=None):
-    """Save metadata dict to JSON and CSV, with success/failure stats."""
+    """Save metadata dict to JSON, with success/failure stats."""
     os.makedirs(out_dir, exist_ok=True)
 
     summary = {
-        "total_plans": len(metadata),
+        "total_plans": success_count+fail_count,
         "success_count": success_count,
         "fail_count": fail_count,
         "plans_succeeded": plans_succeeded or [],
         "plans_failed": plans_failed or [],
-        "files": metadata
+        "files": saved_files_metadata
     }
 
     # JSON
     json_path = os.path.join(out_dir, "centene_metadata.json")
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(summary, jf, indent=2, ensure_ascii=False)
-    print(f"[INFO] Metadata saved to {json_path}")
-
-    # CSV
-    csv_path = os.path.join(out_dir, "centene_metadata.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as cf:
-        writer = csv.writer(cf)
-        writer.writerow(["plan_id", "status", "label", "url"])
-        for plan_id, files in metadata.items():
-            status = "success" if plan_id in (plans_succeeded or []) else "failed"
-            for label, url in files.items():
-                writer.writerow([plan_id, label, url, status])
-    print(f"[INFO] Metadata saved to {csv_path}")
 
 
 state_options = {
@@ -151,36 +139,6 @@ state_options = {
     "WY":"Wyoming",
 }
 
-# # unused, implemented directly in load_plan_details
-# def format_plan_links(csv_path):
-#     output = []
-#     with open(csv_path, newline="", encoding="utf-8") as f:
-#         reader = csv.reader(f)
-#         for row in reader:
-#             state, county, fips, zip_code, company, plan_name, plan_type, plan_id, url = row
-
-#             # Convert state code → full state name (lowercase, spaces removed)
-#             state_full = state_options.get(state, state).lower().replace(" ", "-")
-
-#             # Normalize plan name
-#             name = plan_name.lower()
-#             name = re.sub(r"[()]", "", name)       # remove parentheses
-#             name = re.sub(r"\s+", "-", name)       # spaces → hyphen
-#             name = re.sub(r"-+", "-", name)        # collapse multiple hyphens
-
-#             # Get 2nd segment of plan_id
-#             segments = plan_id.split("-")
-#             suffix = segments[1] if len(segments) > 1 else ""
-
-#             formatted = f"{state_full}/members/medicare-plans-2025/{name}-{suffix}"
-#             output.append(formatted)
-#     return output
-
-# # Example usage
-# csv_file = "centene_plan_links.csv"
-# for link in format_plan_links(csv_file):
-#     print(link)
-# input("stop")
 
 DOC_LABELS = [
     "Summary of Benefits",
@@ -194,96 +152,88 @@ def safe_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._\-]+", "_", s)
 
 
-# ToDo: wire this in to wait_scroll_interact, etc.
-def click_when_ready(driver, button_locator, timeout=15):
-    wait = WebDriverWait(driver, timeout)
+def _norm_label(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"\s+", "_", s)
+    return re.sub(r"[^A-Za-z0-9_]+", "", s)
 
-    # Wait for the loading indicator to disappear
-    wait.until(EC.invisibility_of_element_located((By.CSS_SELECTOR, ".loading-indicator")))
+def _looks_like_pdf(url: str) -> bool:
+    u = url.lower()
+    return (".pdf" in u) or (".ashx" in u)
 
-    # Wait for the button to be clickable
-    button = wait.until(EC.element_to_be_clickable(button_locator))
-
-    button.click()
-    """usage:
-    click_when_ready(
-        driver,
-        (By.CSS_SELECTOR, "#plan-details-btn-2")  # or whatever locator you use
-    )
-    """
-
-
-def get_enrollment_pdfs(driver, timeout=15, scroll_pause=1.0):
+def get_enrollment_pdfs(driver, timeout=20, scroll_pause=0.8):
     """
     Scrapes the current plan details page for ALL enrollment-related PDFs.
-    Returns dict of {label: url}, with language suffixes when available.
+    Returns dict of {label: url}, using the visible label in the left column of each row.
     """
     wait = WebDriverWait(driver, timeout)
-    pdfs = {}
+    pdfs: dict[str, str] = {}
 
-    # Step 1: Wait for at least one container with links
+    # 1) Wait for the rows to exist
     wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".mod-item-container")))
 
-    # Step 2: Scroll to bottom for lazy loading
-    last_height = driver.execute_script("return document.body.scrollHeight")
+    # 2) Lazy-load scroll
+    last_h = driver.execute_script("return document.body.scrollHeight")
     while True:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         sleep(scroll_pause)
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        if new_height == last_height:
+        new_h = driver.execute_script("return document.body.scrollHeight")
+        if new_h == last_h:
             break
-        last_height = new_height
+        last_h = new_h
 
-    # Step 3: Collect containers
+    # 3) Walk rows, extract the human label from the left column, then collect links
     containers = driver.find_elements(By.CSS_SELECTOR, ".mod-item-container")
-    for container in containers:
+    for idx, container in enumerate(containers, start=1):
         try:
-            # Get descriptive label text
+            # The visible text label is here:
             try:
-                label = container.find_element(By.CSS_SELECTOR, ".document-title").text.strip()
+                lbl_el = container.find_element(By.CSS_SELECTOR, "div.large-9.columns > label")
             except Exception:
-                label = "plan_file"
+                # Fallback: any label in this row
+                lbl_el = container.find_element(By.TAG_NAME, "label")
+            base_label = _norm_label(lbl_el.text) if lbl_el and lbl_el.text.strip() else f"plan_file_{idx}"
 
-            # Normalize the label
-            label = re.sub(r"\s+", "_", label)
-            label = re.sub(r"[^A-Za-z0-9_]+", "", label)
+            # We’ll also use surrounding text to infer language when the URL doesn’t help
+            row_text = container.text.lower()
 
-            # Collect all <a> links in this container
-            anchors = container.find_elements(By.TAG_NAME, "a")
+            # Collect all candidate links in this row
+            anchors = container.find_elements(By.CSS_SELECTOR, "a[href]")
             for a in anchors:
-                href = a.get_attribute("href")
-                if not href:
-                    continue
-                if not (href.lower().endswith(".pdf") or href.lower().endswith(".ashx")):
+                href = a.get_attribute("href") or ""
+                if not _looks_like_pdf(href):
                     continue
 
-                # Detect language hints
-                lang = None
-                href_lower = href.lower()
-                if "spanish" in href_lower or "es_" in href_lower or "/es/" in href_lower:
-                    lang = "es"
-                elif "english" in href_lower or "en_" in href_lower or "/en/" in href_lower:
-                    lang = "en"
-                if lang:
-                    label_lang = f"{label}_{lang}"
-                else:
-                    label_lang = label
-
-                # Handle duplicates safely
-                final_label = label_lang
-                counter = 2
-                while final_label in pdfs:
-                    final_label = f"{label_lang}_{counter}"
-                    counter += 1
-
-                # Ensure absolute URL
+                # Absolute URL
                 if href.startswith("/"):
                     href = "https://www.wellcare.com" + href
+
+                # Language detection (URL first, then row text as fallback)
+                h = href.lower()
+                lang = None
+                if any(tok in h for tok in ["_spa_", "/es/", "spanish"]):
+                    lang = "es"
+                elif any(tok in h for tok in ["_eng_", "/en/", "english"]):
+                    lang = "en"
+                else:
+                    if "spanish" in row_text and "english" not in row_text:
+                        lang = "es"
+                    elif "english" in row_text and "spanish" not in row_text:
+                        lang = "en"
+
+                label = f"{base_label}_{lang}" if lang else base_label
+
+                # De-dupe if multiple links share the same label
+                final_label = label
+                n = 2
+                while final_label in pdfs:
+                    final_label = f"{label}_{n}"
+                    n += 1
 
                 pdfs[final_label] = href
 
         except Exception as e:
-            print(f"    [WARN] error parsing container: {e}")
+            print(f"    [WARN] error parsing container {idx}: {e}")
             continue
 
     return pdfs
@@ -332,7 +282,7 @@ def load_plan_details(csv_path="centene_plan_links.csv"):
 
 
 def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
-    all_metadata = {}
+    saved_files_metadata = {}
     success_count = 0
     fail_count = 0
     plans_succeeded = []
@@ -376,7 +326,7 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
                 driver.get(url)
                 sleep(2.0)
                 pdfs = get_enrollment_pdfs(driver)
-                all_metadata[plan_id] = pdfs
+                saved_files_metadata[plan_id] = pdfs
 
                 if not pdfs:
                     print("    [WARN] No PDFs found")
@@ -409,7 +359,7 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
 
             # ✅ Save after each plan
             save_metadata(
-                all_metadata,
+                saved_files_metadata,
                 LOG_DIR,
                 success_count=success_count,
                 fail_count=fail_count,
