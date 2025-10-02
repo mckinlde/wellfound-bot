@@ -40,6 +40,7 @@ from urllib.parse import urljoin
 import logging
 import csv
 import re
+import json
 
 import pandas as pd
 from selenium.webdriver.common.by import By
@@ -63,6 +64,26 @@ LOG_DIR = "medicare/centene/testrun/"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = "medicare/centene/testrun/centene_pdf_grabber.log"
 logger = logging.getLogger("centene_pdf_grabber")
+
+def save_metadata(metadata: dict, out_dir: str):
+    """Save metadata dict to JSON and CSV."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    # JSON dump
+    json_path = os.path.join(out_dir, "centene_metadata.json")
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(metadata, jf, indent=2, ensure_ascii=False)
+    print(f"[INFO] Metadata saved to {json_path}")
+
+    # CSV dump
+    csv_path = os.path.join(out_dir, "centene_metadata.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as cf:
+        writer = csv.writer(cf)
+        writer.writerow(["plan_id", "label", "url"])
+        for plan_id, files in metadata.items():
+            for label, url in files.items():
+                writer.writerow([plan_id, label, url])
+    print(f"[INFO] Metadata saved to {csv_path}")
 
 
 state_options = {
@@ -253,6 +274,8 @@ def load_plan_details(csv_path="centene_plan_links.csv"):
 
 
 def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
+    all_metadata = {}
+
     plans = load_plan_details(csv_path)
     total = len(plans)
     if total == 0:
@@ -291,6 +314,8 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
                 driver.get(url)
                 sleep(2.0)
                 pdfs = get_enrollment_pdfs(driver)
+                all_metadata[plan_id] = pdfs
+
             except Exception as e:
                 print(f"    [ERROR] navigation failed for {plan_id}: {e}")
                 logger.error(f"    [ERROR] navigation failed for {plan_id}: {e}")
@@ -321,8 +346,8 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
 
                 download_pdf(session, href, out_path)
                 sleep(1.2)
-
             sleep(2.5)
+        save_metadata(all_metadata, LOG_DIR)
 
 
 if __name__ == "__main__":
