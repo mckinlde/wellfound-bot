@@ -216,17 +216,15 @@ def click_when_ready(driver, button_locator, timeout=15):
 def get_enrollment_pdfs(driver, timeout=15, scroll_pause=1.0):
     """
     Scrapes the current plan details page for ALL enrollment-related PDFs.
-    Returns dict of {label: url}, using the visible document titles, not just "Download".
+    Returns dict of {label: url}, with language suffixes when available.
     """
     wait = WebDriverWait(driver, timeout)
     pdfs = {}
 
-    # Wait for at least one PDF link
-    wait.until(EC.presence_of_all_elements_located(
-        (By.XPATH, "//a[contains(@href, '.pdf') or contains(@href, '.ashx')]")
-    ))
+    # Step 1: Wait for at least one container with links
+    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".mod-item-container")))
 
-    # Scroll for lazy loading
+    # Step 2: Scroll to bottom for lazy loading
     last_height = driver.execute_script("return document.body.scrollHeight")
     while True:
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -236,55 +234,57 @@ def get_enrollment_pdfs(driver, timeout=15, scroll_pause=1.0):
             break
         last_height = new_height
 
-    # Each document lives in .mod-item-container
+    # Step 3: Collect containers
     containers = driver.find_elements(By.CSS_SELECTOR, ".mod-item-container")
     for container in containers:
         try:
-            # Document title is usually in the container text before "Download"
-            heading_el = container.find_element(By.CSS_SELECTOR, ".title, h3, strong, span")
-            doc_title = heading_el.text.strip() if heading_el else ""
-        except Exception:
-            doc_title = ""
+            # Get descriptive label text
+            try:
+                label = container.find_element(By.CSS_SELECTOR, ".document-title").text.strip()
+            except Exception:
+                label = "plan_file"
 
-        anchors = container.find_elements(By.TAG_NAME, "a")
-        for a in anchors:
-            href = a.get_attribute("href")
-            if not href:
-                continue
-            if not (href.lower().endswith(".pdf") or href.lower().endswith(".ashx")):
-                continue
-
-            # Use container heading text if available, otherwise fallback
-            label = doc_title or (a.get_attribute("title") or a.text or os.path.basename(href))
-
-            # Normalize
+            # Normalize the label
             label = re.sub(r"\s+", "_", label)
             label = re.sub(r"[^A-Za-z0-9_]+", "", label)
 
-            # Detect language
-            lang = None
-            href_lower = href.lower()
-            if "spanish" in href_lower or "es_" in href_lower or "/es/" in href_lower:
-                lang = "es"
-            elif "english" in href_lower or "en_" in href_lower or "/en/" in href_lower:
-                lang = "en"
-            if lang:
-                label = f"{label}_{lang}"
+            # Collect all <a> links in this container
+            anchors = container.find_elements(By.TAG_NAME, "a")
+            for a in anchors:
+                href = a.get_attribute("href")
+                if not href:
+                    continue
+                if not (href.lower().endswith(".pdf") or href.lower().endswith(".ashx")):
+                    continue
 
-            # Avoid collisions
-            if label in pdfs:
+                # Detect language hints
+                lang = None
+                href_lower = href.lower()
+                if "spanish" in href_lower or "es_" in href_lower or "/es/" in href_lower:
+                    lang = "es"
+                elif "english" in href_lower or "en_" in href_lower or "/en/" in href_lower:
+                    lang = "en"
+                if lang:
+                    label_lang = f"{label}_{lang}"
+                else:
+                    label_lang = label
+
+                # Handle duplicates safely
+                final_label = label_lang
                 counter = 2
-                new_label = f"{label}_{counter}"
-                while new_label in pdfs:
+                while final_label in pdfs:
+                    final_label = f"{label_lang}_{counter}"
                     counter += 1
-                    new_label = f"{label}_{counter}"
-                label = new_label
 
-            # Ensure full URL
-            if href.startswith("/"):
-                href = "https://www.wellcare.com" + href
+                # Ensure absolute URL
+                if href.startswith("/"):
+                    href = "https://www.wellcare.com" + href
 
-            pdfs[label] = href
+                pdfs[final_label] = href
+
+        except Exception as e:
+            print(f"    [WARN] error parsing container: {e}")
+            continue
 
     return pdfs
 
