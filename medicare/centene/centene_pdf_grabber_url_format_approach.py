@@ -65,24 +65,35 @@ os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = "medicare/centene/testrun/centene_pdf_grabber.log"
 logger = logging.getLogger("centene_pdf_grabber")
 
-def save_metadata(metadata: dict, out_dir: str):
-    """Save metadata dict to JSON and CSV."""
+def save_metadata(metadata: dict, out_dir: str, success_count=0, fail_count=0,
+                  plans_succeeded=None, plans_failed=None):
+    """Save metadata dict to JSON and CSV, with success/failure stats."""
     os.makedirs(out_dir, exist_ok=True)
 
-    # JSON dump
+    summary = {
+        "total_plans": len(metadata),
+        "success_count": success_count,
+        "fail_count": fail_count,
+        "plans_succeeded": plans_succeeded or [],
+        "plans_failed": plans_failed or [],
+        "files": metadata
+    }
+
+    # JSON
     json_path = os.path.join(out_dir, "centene_metadata.json")
     with open(json_path, "w", encoding="utf-8") as jf:
-        json.dump(metadata, jf, indent=2, ensure_ascii=False)
+        json.dump(summary, jf, indent=2, ensure_ascii=False)
     print(f"[INFO] Metadata saved to {json_path}")
 
-    # CSV dump
+    # CSV
     csv_path = os.path.join(out_dir, "centene_metadata.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as cf:
         writer = csv.writer(cf)
-        writer.writerow(["plan_id", "label", "url"])
+        writer.writerow(["plan_id", "label", "url", "status"])
         for plan_id, files in metadata.items():
+            status = "success" if plan_id in (plans_succeeded or []) else "failed"
             for label, url in files.items():
-                writer.writerow([plan_id, label, url])
+                writer.writerow([plan_id, label, url, status])
     print(f"[INFO] Metadata saved to {csv_path}")
 
 
@@ -314,6 +325,11 @@ def load_plan_details(csv_path="centene_plan_links.csv"):
 
 def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
     all_metadata = {}
+    success_count = 0
+    fail_count = 0
+    plans_succeeded = []
+    plans_failed = []
+
 
     plans = load_plan_details(csv_path)
     total = len(plans)
@@ -355,9 +371,23 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
                 pdfs = get_enrollment_pdfs(driver)
                 all_metadata[plan_id] = pdfs
 
+                if not pdfs:
+                    print("    [WARN] No PDFs found")
+                    logger.info("    [WARN] No PDFs found")
+                    fail_count += 1
+                    plans_failed.append(plan_id)
+                    sleep(2.0)
+                    continue
+
+                # ✅ If we got here, navigation + scrape succeeded
+                success_count += 1
+                plans_succeeded.append(plan_id)
+
             except Exception as e:
                 print(f"    [ERROR] navigation failed for {url}: {e}")
                 logger.error(f"    [ERROR] navigation failed for {url}: {e}")
+                fail_count += 1
+                plans_failed.append(plan_id)
                 continue
 
             if not pdfs:
@@ -386,7 +416,15 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
                 download_pdf(session, href, out_path)
                 sleep(1.2)
             sleep(2.5)
-        save_metadata(all_metadata, LOG_DIR)
+        save_metadata(
+            all_metadata,
+            LOG_DIR,
+            success_count=success_count,
+            fail_count=fail_count,
+            plans_succeeded=plans_succeeded,
+            plans_failed=plans_failed
+        )
+
 
 
 if __name__ == "__main__":
