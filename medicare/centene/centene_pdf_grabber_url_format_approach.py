@@ -202,30 +202,69 @@ def click_when_ready(driver, button_locator, timeout=15):
     """
 
 
-def get_enrollment_pdfs(driver, timeout=10):
+def get_enrollment_pdfs(driver, timeout=15, scroll_pause=1.0):
     """
-    Scrapes the current page for PDF links.
-
-    Returns a dict of {label: url}
+    Scrapes the current plan details page for ALL enrollment-related PDFs.
+    Returns dict of {label: url}, with _en / _es suffixes when language can be detected.
     """
     wait = WebDriverWait(driver, timeout)
     pdfs = {}
 
-    # Wait for any <a> with href ending in .pdf to appear
-    anchors = wait.until(
-        EC.presence_of_all_elements_located((By.XPATH, "//a[contains(@href, '.pdf')]"))
-    )
+    # Step 1: Wait for at least one PDF link
+    wait.until(EC.presence_of_all_elements_located((By.XPATH, "//a[contains(@href, '.pdf')]")))
+
+    # Step 2: Scroll to bottom for lazy loading
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    while True:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        sleep(scroll_pause)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+
+    # Step 3: Collect all anchors with .pdf links
+    anchors = driver.find_elements(By.XPATH, "//a[contains(@href, '.pdf')]")
 
     for a in anchors:
         try:
             href = a.get_attribute("href")
-            text = a.text.strip()
-            if href and href.lower().endswith(".pdf"):
-                # Clean label for filenames
-                label = re.sub(r"\s+", "_", text)
-                label = re.sub(r"[^A-Za-z0-9_]+", "", label)  # strip weird chars
-                pdfs[label] = href
-        except Exception:
+            if not href or not href.lower().endswith(".pdf"):
+                continue
+
+            # Detect language
+            lang = None
+            href_lower = href.lower()
+            if "/es/" in href_lower or "spanish" in href_lower:
+                lang = "es"
+            elif "/en/" in href_lower or "english" in href_lower:
+                lang = "en"
+
+            # Prefer visible text, fallback to aria-label/title or filename
+            label = (a.text or "").strip()
+            if not label:
+                label = a.get_attribute("aria-label") or a.get_attribute("title") or os.path.basename(href)
+
+            # Normalize label
+            label = re.sub(r"\s+", "_", label)
+            label = re.sub(r"[^A-Za-z0-9_]+", "", label)
+
+            # Add language suffix if detected
+            if lang:
+                label = f"{label}_{lang}"
+
+            # Avoid collisions (e.g. multiple directories in EN)
+            if label in pdfs:
+                counter = 2
+                new_label = f"{label}_{counter}"
+                while new_label in pdfs:
+                    counter += 1
+                    new_label = f"{label}_{counter}"
+                label = new_label
+
+            pdfs[label] = href
+        except Exception as e:
+            print(f"    [WARN] error parsing anchor: {e}")
             continue
 
     return pdfs
@@ -307,8 +346,8 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
             zip_code, plan_name, plan_id, fragment = plans[i]
             url = f"https://www.wellcare.com/en/{fragment}"
 
-            print(f"[INFO] ({i+1}/{total}) {plan_id} {plan_name} ({zip_code})")
-            logger.info(f"[INFO] ({i+1}/{total}) {plan_id} {plan_name} ({zip_code})")
+            print(f"[INFO] ({i+1}/{total}) {url}")
+            logger.info(f"[INFO] ({i+1}/{total}) {url}")
 
             try:
                 driver.get(url)
@@ -317,8 +356,8 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
                 all_metadata[plan_id] = pdfs
 
             except Exception as e:
-                print(f"    [ERROR] navigation failed for {plan_id}: {e}")
-                logger.error(f"    [ERROR] navigation failed for {plan_id}: {e}")
+                print(f"    [ERROR] navigation failed for {url}: {e}")
+                logger.error(f"    [ERROR] navigation failed for {url}: {e}")
                 continue
 
             if not pdfs:
