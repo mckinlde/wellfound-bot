@@ -335,7 +335,6 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
     plans_succeeded = []
     plans_failed = []
 
-
     plans = load_plan_details(csv_path)
     total = len(plans)
     if total == 0:
@@ -381,55 +380,41 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
                     logger.info("    [WARN] No PDFs found")
                     fail_count += 1
                     plans_failed.append(plan_id)
-                    sleep(2.0)
-                    continue
+                else:
+                    success_count += 1
+                    plans_succeeded.append(plan_id)
 
-                # ✅ If we got here, navigation + scrape succeeded
-                success_count += 1
-                plans_succeeded.append(plan_id)
+                    out_dir = os.path.join(OUTPUT_DIR, plan_id)
+                    os.makedirs(out_dir, exist_ok=True)
 
+                    print(f"    [FOUND {len(pdfs)} PDFs]")
+                    for label, href in pdfs.items():
+                        filename = f"{safe_name(plan_id)}_{safe_name(label)}.pdf"
+                        out_path = os.path.join(out_dir, filename)
+
+                        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                            print(f"    [SKIP] {filename} (exists)")
+                            continue
+
+                        download_pdf(session, href, out_path)
+                        sleep(1.2)
             except Exception as e:
                 print(f"    [ERROR] navigation failed for {plan_id} {url}: {e}")
                 logger.error(f"    [ERROR] navigation failed for {plan_id} {url}: {e}")
                 fail_count += 1
                 plans_failed.append(plan_id)
-                continue
 
-            if not pdfs:
-                print("    [WARN] No PDFs found")
-                logger.info("    [WARN] No PDFs found")
-                sleep(2.0)
-                continue
+            # ✅ Save after each plan
+            save_metadata(
+                all_metadata,
+                LOG_DIR,
+                success_count=success_count,
+                fail_count=fail_count,
+                plans_succeeded=plans_succeeded,
+                plans_failed=plans_failed
+            )
 
-            out_dir = os.path.join(OUTPUT_DIR, plan_id)
-            os.makedirs(out_dir, exist_ok=True)
-
-            print(f"    [FOUND {len(pdfs)} PDFs]")
-            logger.info(f"    [FOUND {len(pdfs)} PDFs]")
-            # debug input("pause")
-            for label, href in pdfs.items():
-                print(f"      -> {label}: {href}")
-                logger.info(f"      -> {label}: {href}")
-
-                filename = f"{safe_name(plan_id)}_{safe_name(label)}.pdf"
-                out_path = os.path.join(out_dir, filename)
-
-                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                    print(f"    [SKIP] {filename} (exists)")
-                    logger.info(f"    [SKIP] {filename} (exists)")
-                    continue
-
-                download_pdf(session, href, out_path)
-                sleep(1.2)
             sleep(2.5)
-        save_metadata(
-            all_metadata,
-            LOG_DIR,
-            success_count=success_count,
-            fail_count=fail_count,
-            plans_succeeded=plans_succeeded,
-            plans_failed=plans_failed
-        )
 
 
 
