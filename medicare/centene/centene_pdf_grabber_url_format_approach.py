@@ -60,9 +60,9 @@ BASE_ORIGIN = "https://www.wellcare.com/en/medicare"
 BASE_URL = f"{BASE_ORIGIN}"
 OUTPUT_DIR = "centene_PDFs"
 
-LOG_DIR = "medicare/centene/testrun/"
+LOG_DIR = "testrun/"
 os.makedirs(LOG_DIR, exist_ok=True)
-LOG_FILE = "medicare/centene/testrun/centene_pdf_grabber.log"
+LOG_FILE = "testrun/centene_pdf_grabber.log"
 logger = logging.getLogger("centene_pdf_grabber")
 
 def save_metadata(metadata: dict, out_dir: str, success_count=0, fail_count=0,
@@ -216,13 +216,13 @@ def click_when_ready(driver, button_locator, timeout=15):
 def get_enrollment_pdfs(driver, timeout=15, scroll_pause=1.0):
     """
     Scrapes the current plan details page for ALL enrollment-related PDFs.
-    Returns dict of {label: url}, with _en / _es suffixes when language can be detected.
+    Returns dict of {label: url}, with language suffixes when available.
     """
     wait = WebDriverWait(driver, timeout)
     pdfs = {}
 
     # Step 1: Wait for at least one PDF link
-    wait.until(EC.presence_of_all_elements_located((By.XPATH, "//a[contains(@href, '.pdf')]")))
+    wait.until(EC.presence_of_all_elements_located((By.XPATH, "//a[contains(@href, '.pdf') or contains(@href, '.ashx')]")))
 
     # Step 2: Scroll to bottom for lazy loading
     last_height = driver.execute_script("return document.body.scrollHeight")
@@ -234,49 +234,54 @@ def get_enrollment_pdfs(driver, timeout=15, scroll_pause=1.0):
             break
         last_height = new_height
 
-    # Step 3: Collect all anchors with .pdf links
-    anchors = driver.find_elements(By.XPATH, "//a[contains(@href, '.pdf')]")
+    # Step 3: Collect ALL anchors under .mod-item-container (both Plan Specific Docs + Related Materials)
+    containers = driver.find_elements(By.CSS_SELECTOR, ".mod-item-container")
+    for container in containers:
+        anchors = container.find_elements(By.TAG_NAME, "a")
+        for a in anchors:
+            try:
+                href = a.get_attribute("href")
+                if not href:
+                    continue
+                if not (href.lower().endswith(".pdf") or href.lower().endswith(".ashx")):
+                    continue
 
-    for a in anchors:
-        try:
-            href = a.get_attribute("href")
-            if not href or not href.lower().endswith(".pdf"):
-                continue
+                # Try to build a useful label
+                label = (a.text or "").strip()
+                if not label:
+                    label = a.get_attribute("aria-label") or a.get_attribute("title") or os.path.basename(href)
 
-            # Detect language
-            lang = None
-            href_lower = href.lower()
-            if "/es/" in href_lower or "spanish" in href_lower:
-                lang = "es"
-            elif "/en/" in href_lower or "english" in href_lower:
-                lang = "en"
+                # Normalize label
+                label = re.sub(r"\s+", "_", label)
+                label = re.sub(r"[^A-Za-z0-9_]+", "", label)
 
-            # Prefer visible text, fallback to aria-label/title or filename
-            label = (a.text or "").strip()
-            if not label:
-                label = a.get_attribute("aria-label") or a.get_attribute("title") or os.path.basename(href)
+                # Detect language hints
+                lang = None
+                href_lower = href.lower()
+                if "spanish" in href_lower or "es_" in href_lower or "/es/" in href_lower:
+                    lang = "es"
+                elif "english" in href_lower or "en_" in href_lower or "/en/" in href_lower:
+                    lang = "en"
+                if lang:
+                    label = f"{label}_{lang}"
 
-            # Normalize label
-            label = re.sub(r"\s+", "_", label)
-            label = re.sub(r"[^A-Za-z0-9_]+", "", label)
-
-            # Add language suffix if detected
-            if lang:
-                label = f"{label}_{lang}"
-
-            # Avoid collisions (e.g. multiple directories in EN)
-            if label in pdfs:
-                counter = 2
-                new_label = f"{label}_{counter}"
-                while new_label in pdfs:
-                    counter += 1
+                # Avoid collisions
+                if label in pdfs:
+                    counter = 2
                     new_label = f"{label}_{counter}"
-                label = new_label
+                    while new_label in pdfs:
+                        counter += 1
+                        new_label = f"{label}_{counter}"
+                    label = new_label
 
-            pdfs[label] = href
-        except Exception as e:
-            print(f"    [WARN] error parsing anchor: {e}")
-            continue
+                # Ensure full URL
+                if href.startswith("/"):
+                    href = "https://www.wellcare.com" + href
+
+                pdfs[label] = href
+            except Exception as e:
+                print(f"    [WARN] error parsing anchor: {e}")
+                continue
 
     return pdfs
 
@@ -362,8 +367,8 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
             zip_code, plan_name, plan_id, fragment = plans[i]
             url = f"https://www.wellcare.com/en/{fragment}"
 
-            print(f"[INFO] ({i+1}/{total}) {url}")
-            logger.info(f"[INFO] ({i+1}/{total}) {url}")
+            print(f"[INFO] ({i+1}/{total}) {plan_id} {url}")
+            logger.info(f"[INFO] ({i+1}/{total}) {plan_id} {url}")
 
             try:
                 driver.get(url)
@@ -384,8 +389,8 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
                 plans_succeeded.append(plan_id)
 
             except Exception as e:
-                print(f"    [ERROR] navigation failed for {url}: {e}")
-                logger.error(f"    [ERROR] navigation failed for {url}: {e}")
+                print(f"    [ERROR] navigation failed for {plan_id} {url}: {e}")
+                logger.error(f"    [ERROR] navigation failed for {plan_id} {url}: {e}")
                 fail_count += 1
                 plans_failed.append(plan_id)
                 continue
@@ -401,6 +406,7 @@ def main(start_n: int, stop_n: int | None, csv_path="centene_plan_links.csv"):
 
             print(f"    [FOUND {len(pdfs)} PDFs]")
             logger.info(f"    [FOUND {len(pdfs)} PDFs]")
+            # debug input("pause")
             for label, href in pdfs.items():
                 print(f"      -> {label}: {href}")
                 logger.info(f"      -> {label}: {href}")
