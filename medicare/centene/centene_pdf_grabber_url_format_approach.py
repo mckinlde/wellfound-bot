@@ -80,7 +80,7 @@ def save_metadata(saved_files_metadata: dict, out_dir: str, success_count=0, fai
     }
 
     # JSON
-    json_path = os.path.join(out_dir, "centene_metadata.json")
+    json_path = os.path.join(out_dir, "centene_metadata_2026.json")
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(summary, jf, indent=2, ensure_ascii=False)
 
@@ -276,7 +276,7 @@ def load_plan_details(csv_path="centene_plan_links.csv"):
             segments = plan_id.split("-")
             suffix = segments[1] if len(segments) > 1 else ""
 
-            fragment = f"{state_full}/members/medicare-plans-2025/{name}-{suffix}"
+            fragment = f"{state_full}/members/medicare-plans-2026/{name}-{suffix}"
             plans.append((zip_code, plan_name, plan_id, fragment))
     return plans
 
